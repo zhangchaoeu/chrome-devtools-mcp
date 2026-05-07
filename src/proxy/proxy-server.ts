@@ -25,6 +25,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '../third_party/index.js';
+import {VERSION} from '../version.js';
 
 export async function startProxyServer(bridgeUrl: string): Promise<void> {
   const url = new URL('/mcp', bridgeUrl);
@@ -34,7 +35,7 @@ export async function startProxyServer(bridgeUrl: string): Promise<void> {
   const clientTransport = new StreamableHTTPClientTransport(url);
 
   const remoteClient = new Client(
-    {name: 'chrome-devtools-proxy', version: '1.0.0'},
+    {name: 'chrome-devtools-proxy', version: VERSION},
     {capabilities: {}},
   );
 
@@ -45,13 +46,13 @@ export async function startProxyServer(bridgeUrl: string): Promise<void> {
   // We handle tools/list and tools/call manually so we can forward them to the
   // remote client without needing to register Zod schemas for every tool.
   const proxyServer = new LowLevelServer(
-    {name: 'chrome-devtools-proxy', version: '1.0.0'},
+    {name: 'chrome-devtools-proxy', version: VERSION},
     {capabilities: {tools: {}}},
   );
 
   proxyServer.setRequestHandler(ListToolsRequestSchema, async request => {
     logger('Proxy: forwarding tools/list');
-    const result = await remoteClient.listTools(request.params ?? undefined);
+    const result = await remoteClient.listTools(request.params);
     return result;
   });
 

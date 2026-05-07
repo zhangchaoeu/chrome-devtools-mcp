@@ -85,7 +85,7 @@ async function handleRequest(
 
   // New session: create a fresh MCP server and transport.
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
+    sessionIdGenerator: randomUUID,
     onsessioninitialized: (sessionId: string) => {
       sessions.set(sessionId, {transport});
       logger(`Bridge: new session ${sessionId}`);
