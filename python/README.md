@@ -40,7 +40,7 @@ Hermes (33) ──stdio──► relay_server.py (33)
 Python ≥ 3.11 on both machines (uses `asyncio` from the standard library).
 
 ```bash
-pip install -r requirements.txt   # installs websockets>=10
+pip install -r requirements.txt   # installs websockets>=13
 ```
 
 ## Quick start

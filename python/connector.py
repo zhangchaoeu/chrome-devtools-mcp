@@ -78,31 +78,20 @@ async def read_from_proc(
     proc: asyncio.subprocess.Process,
 ) -> dict[str, Any]:
     """
-    Read one Content-Length-framed MCP JSON-RPC message from the subprocess
-    stdout.  Raises EOFError if the process closes its stdout.
+    Read one single-line (newline-delimited) MCP JSON-RPC message from the
+    subprocess stdout. Raises EOFError if the process closes its stdout.
     """
     if proc.stdout is None:
         raise RuntimeError("Subprocess has no stdout stream")
 
-    header = b""
     while True:
-        ch = await proc.stdout.read(1)
-        if not ch:
+        line = await proc.stdout.readline()
+        if not line:
             raise EOFError("Subprocess stdout closed unexpectedly")
-        header += ch
-        if header.endswith(b"\r\n\r\n"):
-            break
-
-    content_length = 0
-    for line in header.decode("ascii", errors="replace").split("\r\n"):
-        if line.lower().startswith("content-length:"):
-            content_length = int(line.split(":", 1)[1].strip())
-
-    if content_length == 0:
-        return {}
-
-    body = await proc.stdout.readexactly(content_length)
-    return json.loads(body)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        return json.loads(stripped)
 
 
 async def write_to_proc(
@@ -112,9 +101,8 @@ async def write_to_proc(
     if proc.stdin is None:
         raise RuntimeError("Subprocess has no stdin stream")
 
-    body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
-    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-    proc.stdin.write(header + body)
+    body = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
+    proc.stdin.write(body)
     await proc.stdin.drain()
 
 
