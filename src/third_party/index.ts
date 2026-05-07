@@ -25,6 +25,9 @@ export {type ShapeOutput} from '@modelcontextprotocol/sdk/server/zod-compat.js';
 export {StdioServerTransport} from '@modelcontextprotocol/sdk/server/stdio.js';
 export {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 export {Client} from '@modelcontextprotocol/sdk/client/index.js';
+export {Server as LowLevelServer} from '@modelcontextprotocol/sdk/server/index.js';
+export {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+export {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 export {
   type CallToolResult,
   SetLevelRequestSchema,
@@ -34,6 +37,8 @@ export {
   ListRootsRequestSchema,
   RootsListChangedNotificationSchema,
   ListRootsResultSchema,
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 export {z as zod} from 'zod';
 export {default as ajv} from 'ajv';
