@@ -41,6 +41,14 @@ Options
 Requirements
 ------------
   pip install "websockets>=13"
+
+Protocol note
+-------------
+  chrome-devtools-mcp uses @modelcontextprotocol/sdk (Node.js) which serialises
+  every JSON-RPC message as a single UTF-8 line terminated with \\n.  This is
+  *different* from the HTTP-style Content-Length framing sometimes described in
+  older MCP documentation.  All reads from / writes to the subprocess therefore
+  use newline-delimited JSON.
 """
 
 from __future__ import annotations
@@ -50,6 +58,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from typing import Any, Optional
 
 try:
@@ -73,71 +82,52 @@ log = logging.getLogger("connector")
 
 # ── MCP subprocess helpers ───────────────────────────────────────────────────
 #
-# chrome-devtools-mcp uses the MCP SDK's StdioServerTransport which frames
-# every JSON-RPC message with an HTTP-style Content-Length header:
-#
-#   Content-Length: <N>\r\n\r\n<JSON body (N bytes, UTF-8)>
-#
-# Both read_from_proc and write_to_proc implement this framing so that the
-# connector speaks the exact same protocol as any other MCP client.
-
-
-async def _read_exactly(
-    reader: asyncio.StreamReader, n: int
-) -> bytes:
-    """Read exactly *n* bytes from *reader*, raising EOFError on short read."""
-    buf = b""
-    while len(buf) < n:
-        chunk = await reader.read(n - len(buf))
-        if not chunk:
-            raise EOFError(
-                f"Subprocess stdout closed after {len(buf)}/{n} bytes"
-            )
-        buf += chunk
-    return buf
+# chrome-devtools-mcp uses @modelcontextprotocol/sdk's StdioServerTransport
+# which serialises each JSON-RPC message as a single UTF-8 line terminated
+# with '\n'.  The connector must use the same framing.
 
 
 async def read_from_proc(
     proc: asyncio.subprocess.Process,
+    deadline: float,
 ) -> dict[str, Any]:
     """
-    Read one Content-Length-framed MCP JSON-RPC message from the subprocess
-    stdout.  Raises EOFError if the process closes its stdout.
+    Read one newline-delimited JSON-RPC message from the subprocess stdout.
+    Raises EOFError on process exit, TimeoutError if *deadline* (monotonic
+    seconds) is exceeded.
     """
     if proc.stdout is None:
         raise RuntimeError("Subprocess has no stdout stream")
 
-    # Read header bytes until we see the blank line (\r\n\r\n).
-    header_bytes = b""
-    while not header_bytes.endswith(b"\r\n\r\n"):
-        ch = await proc.stdout.read(1)
-        if not ch:
-            raise EOFError("Subprocess stdout closed while reading header")
-        header_bytes += ch
-
-    content_length = 0
-    for line in header_bytes.decode("ascii", errors="replace").split("\r\n"):
-        if line.lower().startswith("content-length:"):
-            content_length = int(line.split(":", 1)[1].strip())
-
-    if content_length == 0:
-        return {}
-
-    body = await _read_exactly(proc.stdout, content_length)
-    return json.loads(body)
+    chunks: list[bytes] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("deadline exceeded while reading subprocess")
+        try:
+            chunk = await asyncio.wait_for(
+                proc.stdout.readline(), timeout=remaining
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError("deadline exceeded while reading subprocess")
+        if not chunk:
+            raise EOFError("Subprocess stdout closed")
+        if chunk.strip():
+            return json.loads(chunk.decode("utf-8"))
+        # blank line — check deadline before looping
+        if time.monotonic() >= deadline:
+            raise TimeoutError("deadline exceeded while reading subprocess")
 
 
 async def write_to_proc(
     proc: asyncio.subprocess.Process, msg: dict[str, Any]
 ) -> None:
-    """Write one Content-Length-framed MCP JSON-RPC message to the subprocess
-    stdin."""
+    """Write one newline-delimited JSON-RPC message to the subprocess stdin."""
     if proc.stdin is None:
         raise RuntimeError("Subprocess has no stdin stream")
 
-    body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
-    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-    proc.stdin.write(header + body)
+    line = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+    proc.stdin.write(line)
     await proc.stdin.drain()
 
 
@@ -149,9 +139,8 @@ class McpProcess:
     Manages a single chrome-devtools-mcp subprocess.
 
     Requests are serialised via an asyncio.Lock so that only one request is
-    in-flight at a time on the subprocess stdio channel.  This keeps the
-    implementation simple while still supporting concurrent requests from the
-    relay (they are queued and processed one after another).
+    in-flight at a time on the subprocess stdio channel.  Notifications sent
+    by the subprocess between a request and its response are silently skipped.
     """
 
     def __init__(self, proc: asyncio.subprocess.Process) -> None:
@@ -168,11 +157,9 @@ class McpProcess:
         """
         Forward an MCP request to the subprocess and return its result.
 
-        Raises RuntimeError if the subprocess returns an error response or if
-        *timeout* seconds elapse without a response (e.g. Chrome is waiting for
-        the user to accept the remote-debugging authorisation prompt).  When the
-        timeout fires the subprocess is terminated so the caller can restart it
-        with a clean slate.
+        Notifications (messages without an 'id') that arrive before the
+        matching response are silently dropped.  Raises RuntimeError on
+        subprocess error responses and TimeoutError on timeout.
         """
         async with self._lock:
             msg: dict[str, Any] = {
@@ -182,20 +169,36 @@ class McpProcess:
                 "params": params,
             }
             await write_to_proc(self._proc, msg)
-            try:
-                resp = await asyncio.wait_for(
-                    read_from_proc(self._proc), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                # Terminate the subprocess so the next call gets a fresh
-                # process and does not read a stale response from this one.
-                await self.terminate()
-                raise RuntimeError(
-                    f"MCP subprocess did not respond within {timeout:.0f}s. "
-                    "If Chrome is showing a remote-debugging authorisation "
-                    "prompt, please click 'Allow' to continue. "
-                    "You can adjust the timeout with --tool-timeout."
-                )
+
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    resp = await read_from_proc(self._proc, deadline)
+                except TimeoutError:
+                    await self.terminate()
+                    raise RuntimeError(
+                        f"MCP subprocess did not respond within {timeout:.0f}s. "
+                        "If Chrome is showing a remote-debugging authorisation "
+                        "prompt, please click 'Allow' to continue. "
+                        "You can adjust the timeout with --tool-timeout."
+                    )
+
+                resp_id = resp.get("id")
+                if resp_id is None:
+                    # Notification — log and skip.
+                    log.debug(
+                        "Subprocess notification: %s",
+                        resp.get("method", "?"),
+                    )
+                    continue
+                if str(resp_id) != str(req_id):
+                    log.warning(
+                        "Unexpected response id=%s (expected %s) — skipping",
+                        resp_id,
+                        req_id,
+                    )
+                    continue
+                break
 
         if "error" in resp:
             raise RuntimeError(
@@ -247,11 +250,25 @@ async def start_mcp_process(mcp_args: list[str]) -> McpProcess:
     }
     await write_to_proc(proc, init_req)
 
-    resp = await asyncio.wait_for(read_from_proc(proc), timeout=30)
-    if resp.get("id") != "__init__":
-        raise RuntimeError(
-            f"Unexpected initialisation response: {resp}"
-        )
+    deadline = time.monotonic() + 60  # allow up to 60 s for Chrome to start
+    while True:
+        try:
+            resp = await read_from_proc(proc, deadline)
+        except TimeoutError:
+            raise RuntimeError(
+                "MCP subprocess did not respond to initialize within 60 s. "
+                "Check that Chrome is reachable."
+            )
+
+        resp_id = resp.get("id")
+        if resp_id is None:
+            log.debug("Pre-init notification: %s", resp.get("method", "?"))
+            continue
+        if str(resp_id) != "__init__":
+            log.warning("Unexpected pre-init response id=%s", resp_id)
+            continue
+        break
+
     log.info(
         "MCP subprocess initialised (server: %s)",
         resp.get("result", {}).get("serverInfo", {}).get("name", "?"),

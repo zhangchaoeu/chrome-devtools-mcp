@@ -2,43 +2,44 @@
 """
 chrome-devtools relay server — runs on Server 33.
 
-Presents a standard MCP stdio interface to Hermes (or any MCP client that
-uses stdio) and forwards every tool request to the connector running on PC 32
-via a *reverse* WebSocket tunnel: PC 32 dials into this server, not the other
-way around.
+Exposes a standard MCP server interface to any MCP client and forwards every
+tool request to the connector running on PC 32 via a reverse WebSocket tunnel:
+PC 32 dials into this server, not the other way around.
+
+Two MCP transports are supported so that clients like MCP Inspector can
+connect via URL:
+
+  --transport stdio  (default) — for Claude Desktop / Hermes / any client that
+                                  spawns this script as a subprocess.
+  --transport sse               — HTTP/SSE server on --http-port (default 7001),
+                                  for MCP Inspector and web-based MCP clients.
 
 Network topology
 ----------------
-  Hermes (33) ──stdio──► relay_server.py (33, this file)
-                                  │
-                          WebSocket server
-                          ws://0.0.0.0:7000
-                                  ▲
-                      WebSocket client (initiated by 32)
-                                  │
-                         connector.py (32)
-                                  │
-                         chrome-devtools-mcp
-                                  │
-                            Chrome browser
+  MCP Client (33) ──stdio or HTTP/SSE──► relay_server.py (33, this file)
+                                                  │
+                                          WebSocket server :7000
+                                                  ▲  ← 32 dials 33
+                                          WebSocket client
+                                                  │
+                                           connector.py (32)
+                                                  │ subprocess stdio
+                                         chrome-devtools-mcp (32)
+                                                  │
+                                            Chrome browser (32)
 
 Usage (on Server 33)
 --------------------
-  python relay_server.py [--port 7000] [--host 0.0.0.0]
+  # stdio mode (Claude Desktop / Hermes):
+  python relay_server.py [--port 7000]
 
-Hermes / MCP client config (server.json or claude_desktop_config.json):
-  {
-    "mcpServers": {
-      "chrome_devtools": {
-        "command": "python",
-        "args": ["/path/to/relay_server.py", "--port", "7000"]
-      }
-    }
-  }
+  # SSE/HTTP mode (MCP Inspector, connect via URL http://server33:7001/sse):
+  python relay_server.py --transport sse [--http-port 7001] [--port 7000]
 
 Requirements
 ------------
-  pip install "websockets>=13"
+  pip install -r requirements.txt
+  # websockets>=13  mcp>=1.23.0  starlette>=0.49.1  uvicorn>=0.34.2
 """
 
 from __future__ import annotations
@@ -62,58 +63,24 @@ except ImportError:
     )
     sys.exit(1)
 
+try:
+    import mcp.types as mcp_types
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+except ImportError:
+    print(
+        "ERROR: mcp package not found (need >= 1.23.0). Install it with:\n"
+        "  pip install 'mcp>=1.23.0'",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stderr,
     format="%(asctime)s [relay] %(levelname)s %(message)s",
 )
 log = logging.getLogger("relay")
-
-
-# ── MCP stdio framing helpers ────────────────────────────────────────────────
-
-
-def _blocking_read_message() -> Optional[bytes]:
-    """Read one Content-Length-framed MCP message from stdin (blocking)."""
-    header = b""
-    while True:
-        ch = sys.stdin.buffer.read(1)
-        if not ch:
-            return None  # EOF — Hermes closed the pipe
-        header += ch
-        if header.endswith(b"\r\n\r\n"):
-            break
-
-    content_length = 0
-    for line in header.decode("ascii", errors="replace").split("\r\n"):
-        if line.lower().startswith("content-length:"):
-            content_length = int(line.split(":", 1)[1].strip())
-
-    if content_length == 0:
-        return b"{}"
-    return sys.stdin.buffer.read(content_length)
-
-
-async def read_stdin_message(
-    loop: asyncio.AbstractEventLoop,
-) -> Optional[dict[str, Any]]:
-    """Async wrapper: read one MCP JSON-RPC message from stdin."""
-    raw = await loop.run_in_executor(None, _blocking_read_message)
-    if raw is None:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        log.warning("Malformed JSON from stdin: %s", exc)
-        return {}
-
-
-def write_stdout_message(msg: dict[str, Any]) -> None:
-    """Write one MCP JSON-RPC message to stdout (Content-Length framed)."""
-    body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
-    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-    sys.stdout.buffer.write(header + body)
-    sys.stdout.buffer.flush()
 
 
 # ── Relay state ──────────────────────────────────────────────────────────────
@@ -175,8 +142,6 @@ class RelayState:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
 
-        # Register future and capture connector reference while holding the
-        # lock, then release before awaiting I/O.
         async with self._lock:
             if self._connector is None:
                 raise ConnectionError(
@@ -243,125 +208,252 @@ async def handle_connector(
         await state.clear_connector()
 
 
-# ── MCP protocol (Hermes over stdio) ────────────────────────────────────────
-
-_SERVER_INFO = {"name": "chrome-devtools-relay", "version": "0.1.0"}
+# ── MCP server (official SDK) ─────────────────────────────────────────────────
 
 
-async def handle_mcp(
-    msg: dict[str, Any], state: RelayState
-) -> Optional[dict[str, Any]]:
+def _to_content_item(
+    item: Any,
+) -> mcp_types.TextContent | mcp_types.ImageContent | mcp_types.EmbeddedResource:
+    """Convert a raw content dict (from the connector) to an mcp SDK type."""
+    if isinstance(item, dict):
+        kind = item.get("type", "text")
+        if kind == "image":
+            return mcp_types.ImageContent(
+                type="image",
+                data=item.get("data", ""),
+                mimeType=item.get("mimeType", "image/png"),
+            )
+        if kind == "resource":
+            raw_res = item.get("resource", {})
+            uri: str = raw_res.get("uri", "")
+            mime: Optional[str] = raw_res.get("mimeType")
+            if raw_res.get("blob") is not None:
+                res_contents: (
+                    mcp_types.BlobResourceContents
+                    | mcp_types.TextResourceContents
+                ) = mcp_types.BlobResourceContents(
+                    uri=uri,
+                    blob=raw_res["blob"],
+                    mimeType=mime,
+                )
+            else:
+                res_contents = mcp_types.TextResourceContents(
+                    uri=uri,
+                    text=raw_res.get("text", ""),
+                    mimeType=mime,
+                )
+            return mcp_types.EmbeddedResource(
+                type="resource", resource=res_contents
+            )
+        # default → text
+        return mcp_types.TextContent(
+            type="text",
+            text=item.get("text", json.dumps(item, ensure_ascii=False)),
+        )
+    return mcp_types.TextContent(type="text", text=str(item))
+
+
+def build_mcp_server(state: RelayState) -> Server:
     """
-    Process one MCP JSON-RPC message from Hermes.
+    Construct an MCP Server that proxies tool calls to the connector on PC 32.
 
-    Returns a response dict, or None for notifications (which have no id and
-    require no reply).
+    Using the official mcp SDK ensures correct protocol handling (including
+    the initialize/initialized handshake) for all compliant MCP clients.
     """
-    msg_id = msg.get("id")
-    method = msg.get("method", "")
-    params: dict[str, Any] = msg.get("params") or {}
+    server: Server = Server("chrome-devtools-relay")
 
-    # Notifications carry no id — no reply needed.
-    if msg_id is None:
-        return None
+    @server.list_tools()
+    async def list_tools() -> list[mcp_types.Tool]:
+        try:
+            result = await state.forward("tools/list", {})
+        except ConnectionError as exc:
+            log.warning("tools/list: no connector connected — %s", exc)
+            return []
+        tools = result.get("tools", [])
+        return [
+            mcp_types.Tool(
+                name=t["name"],
+                description=t.get("description", ""),
+                inputSchema=t.get(
+                    "inputSchema", {"type": "object", "properties": {}}
+                ),
+            )
+            for t in tools
+        ]
 
-    try:
-        if method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": params.get(
-                        "protocolVersion", "2024-11-05"
-                    ),
-                    "capabilities": {"tools": {}},
-                    "serverInfo": _SERVER_INFO,
-                },
-            }
+    @server.call_tool()
+    async def call_tool(
+        name: str,
+        arguments: dict[str, Any] | None,
+    ) -> list[
+        mcp_types.TextContent
+        | mcp_types.ImageContent
+        | mcp_types.EmbeddedResource
+    ]:
+        result = await state.forward(
+            "tools/call", {"name": name, "arguments": arguments or {}}
+        )
+        return [_to_content_item(item) for item in result.get("content", [])]
 
-        if method == "ping":
-            return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
-
-        if method in ("tools/list", "tools/call"):
-            result = await state.forward(method, params)
-            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
-
-        # Unknown method
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {
-                "code": -32601,
-                "message": f"Method not found: {method}",
-            },
-        }
-
-    except Exception as exc:
-        log.exception("Error handling method=%s id=%s", method, msg_id)
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {"code": -32603, "message": str(exc)},
-        }
+    return server
 
 
-async def stdio_loop(state: RelayState) -> None:
-    """
-    Main loop: read MCP messages from Hermes over stdin, handle them, write
-    responses back over stdout.
-    """
-    loop = asyncio.get_running_loop()
-    while True:
-        msg = await read_stdin_message(loop)
-        if msg is None:
-            log.info("stdin EOF — shutting down relay")
-            break
-        if not msg:
-            continue
-
-        response = await handle_mcp(msg, state)
-        if response is not None:
-            write_stdout_message(response)
+# ── WebSocket connector server ────────────────────────────────────────────────
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+async def run_ws_server(state: RelayState, host: str, port: int) -> None:
+    """Run the reverse-tunnel WebSocket server that PC 32 dials into."""
+    async with serve(lambda ws: handle_connector(ws, state), host, port):
+        log.info(
+            "Connector WebSocket server listening on ws://%s:%d", host, port
+        )
+        await asyncio.get_running_loop().create_future()  # run until cancelled
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "chrome-devtools relay (Server 33 side). "
-            "Presents an MCP stdio interface to Hermes and forwards requests "
-            "to the connector on PC 32 via a reverse WebSocket tunnel."
+            "Presents an MCP interface (stdio or HTTP/SSE) to MCP clients and "
+            "forwards tool requests to the connector on PC 32 via a reverse "
+            "WebSocket tunnel."
         )
     )
     parser.add_argument(
         "--port",
         type=int,
         default=7000,
-        help="WebSocket port to listen on for the PC 32 connector (default: 7000)",
+        help="WebSocket port for the PC 32 connector (default: 7000)",
     )
     parser.add_argument(
         "--host",
         default="0.0.0.0",
-        help="Interface to bind the WebSocket server to (default: 0.0.0.0)",
+        help="Bind interface for the connector WebSocket server (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help=(
+            "MCP transport: 'stdio' (default, for Claude Desktop / Hermes) or "
+            "'sse' (HTTP/SSE server, for MCP Inspector and web-based clients)"
+        ),
+    )
+    parser.add_argument(
+        "--http-host",
+        default="0.0.0.0",
+        help="Bind address for the HTTP/SSE server when --transport=sse (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=7001,
+        help="Port for the HTTP/SSE MCP server when --transport=sse (default: 7001)",
     )
     args = parser.parse_args()
 
     state = RelayState()
+    server = build_mcp_server(state)
 
-    print(
-        f"chrome-devtools-relay: waiting for connector on "
-        f"ws://{args.host}:{args.port}",
-        file=sys.stderr,
-    )
+    # Always start the WebSocket server so PC 32 can connect at any time.
+    ws_task = asyncio.create_task(run_ws_server(state, args.host, args.port))
 
-    async with serve(
-        lambda ws: handle_connector(ws, state),
-        args.host,
-        args.port,
-    ):
-        await stdio_loop(state)
+    try:
+        if args.transport == "stdio":
+            log.info(
+                "Starting relay in stdio mode (connector WS on ws://%s:%d)",
+                args.host,
+                args.port,
+            )
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+
+        else:  # sse
+            try:
+                from mcp.server.sse import SseServerTransport
+                from starlette.responses import Response
+                from starlette.types import Receive, Scope, Send
+                import uvicorn
+            except ImportError as exc:
+                print(
+                    f"ERROR: SSE transport requires extra packages: {exc}\n"
+                    "  pip install 'starlette>=0.49.1' 'uvicorn>=0.34.2'",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            sse_transport = SseServerTransport("/messages/")
+            init_opts = server.create_initialization_options()
+
+            async def sse_endpoint(
+                scope: Scope, receive: Receive, send: Send
+            ) -> None:
+                async with sse_transport.connect_sse(
+                    scope, receive, send
+                ) as streams:
+                    await server.run(streams[0], streams[1], init_opts)
+
+            async def asgi_router(
+                scope: Scope, receive: Receive, send: Send
+            ) -> None:
+                """
+                Minimal ASGI router that does NOT strip path prefixes or
+                modify scope['root_path'].  This ensures SseServerTransport
+                computes the correct client POST URL (/messages/?session_id=…).
+                """
+                if scope["type"] == "lifespan":
+                    event = await receive()
+                    if event["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    event = await receive()
+                    if event["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                    return
+
+                path: str = scope.get("path", "")
+
+                if scope["type"] == "http":
+                    if path == "/sse":
+                        await sse_endpoint(scope, receive, send)
+                    elif path.startswith("/messages"):
+                        await sse_transport.handle_post_message(
+                            scope, receive, send
+                        )
+                    else:
+                        await Response("Not Found", status_code=404)(
+                            scope, receive, send
+                        )
+
+            log.info(
+                "Starting relay in SSE mode: http://%s:%d/sse "
+                "(connector WS on ws://%s:%d)",
+                args.http_host,
+                args.http_port,
+                args.host,
+                args.port,
+            )
+            uvi_config = uvicorn.Config(
+                asgi_router,
+                host=args.http_host,
+                port=args.http_port,
+                log_level="warning",
+            )
+            uvi_server = uvicorn.Server(uvi_config)
+            await uvi_server.serve()
+
+    finally:
+        ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
