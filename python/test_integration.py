@@ -46,7 +46,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import websockets  # noqa: F401  (used by relay_server)
+    import websockets  # noqa: F401  (indirectly needed: relay_server.py is launched as a subprocess)
 except ImportError:
     print("ERROR: websockets not installed. Run: pip install 'websockets>=13'", file=sys.stderr)
     sys.exit(1)
@@ -263,7 +263,7 @@ async def wait_for_log(proc: subprocess.Popen[bytes], text: str, timeout: float 
         )
         line = line_bytes.decode("utf-8", errors="replace").rstrip()
         if line:
-            log.debug("[%s] %s", proc.args[0].split("/")[-1], line)  # type: ignore[index]
+            log.debug("[%s] %s", os.path.basename(str(proc.args[0])), line)
         if text in line:
             return
 
@@ -494,7 +494,9 @@ def main() -> None:
     # Simplest: set mcp_cmd to the full path and let connector handle it.
     if args.mcp_cmd.endswith(".js"):
         # Create a tiny wrapper so connector.py can exec it directly.
-        wrapper = "/tmp/chrome_devtools_mcp_wrapper.sh"
+        import tempfile
+        tmp_dir = tempfile.gettempdir()
+        wrapper = os.path.join(tmp_dir, "chrome_devtools_mcp_wrapper.sh")
         with open(wrapper, "w") as f:
             f.write(f"#!/bin/sh\nexec node {args.mcp_cmd} --no-usage-statistics \"$@\"\n")
         os.chmod(wrapper, 0o755)

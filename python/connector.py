@@ -114,7 +114,9 @@ async def read_from_proc(
             raise EOFError("Subprocess stdout closed")
         if chunk.strip():
             return json.loads(chunk.decode("utf-8"))
-        # blank line — skip and keep reading
+        # blank line — check deadline before looping
+        if time.monotonic() >= deadline:
+            raise TimeoutError("deadline exceeded while reading subprocess")
 
 
 async def write_to_proc(
