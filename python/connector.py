@@ -124,12 +124,20 @@ class McpProcess:
         self._lock = asyncio.Lock()
 
     async def call(
-        self, req_id: str, method: str, params: dict[str, Any]
+        self,
+        req_id: str,
+        method: str,
+        params: dict[str, Any],
+        timeout: float = 120,
     ) -> dict[str, Any]:
         """
         Forward an MCP request to the subprocess and return its result.
 
-        Raises RuntimeError if the subprocess returns an error response.
+        Raises RuntimeError if the subprocess returns an error response or if
+        *timeout* seconds elapse without a response (e.g. Chrome is waiting for
+        the user to accept the remote-debugging authorisation prompt).  When the
+        timeout fires the subprocess is terminated so the caller can restart it
+        with a clean slate.
         """
         async with self._lock:
             msg: dict[str, Any] = {
@@ -139,7 +147,20 @@ class McpProcess:
                 "params": params,
             }
             await write_to_proc(self._proc, msg)
-            resp = await read_from_proc(self._proc)
+            try:
+                resp = await asyncio.wait_for(
+                    read_from_proc(self._proc), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                # Terminate the subprocess so the next call gets a fresh
+                # process and does not read a stale response from this one.
+                await self.terminate()
+                raise RuntimeError(
+                    f"MCP subprocess did not respond within {timeout:.0f}s. "
+                    "If Chrome is showing a remote-debugging authorisation "
+                    "prompt, please click 'Allow' to continue. "
+                    "You can adjust the timeout with --tool-timeout."
+                )
 
         if "error" in resp:
             raise RuntimeError(
@@ -216,6 +237,7 @@ async def handle_relay_message(
     raw: str | bytes,
     mcp: McpProcess,
     ws: ClientConnection,
+    tool_timeout: float,
 ) -> None:
     """
     Parse one request from the relay, forward it to the MCP subprocess, and
@@ -233,7 +255,7 @@ async def handle_relay_message(
     params: dict[str, Any] = req.get("params") or {}
 
     try:
-        result = await mcp.call(req_id, method, params)
+        result = await mcp.call(req_id, method, params, timeout=tool_timeout)
         response: dict[str, Any] = {"id": req_id, "result": result}
     except Exception as exc:
         log.exception("MCP subprocess error for method=%s", method)
@@ -248,7 +270,7 @@ async def handle_relay_message(
 # ── WebSocket connect-and-run loop ────────────────────────────────────────────
 
 
-async def connect_and_run(relay_url: str, mcp: McpProcess) -> None:
+async def connect_and_run(relay_url: str, mcp: McpProcess, tool_timeout: float) -> None:
     """
     Connect to the relay WebSocket and process requests until the connection
     drops or the MCP subprocess dies.
@@ -267,7 +289,7 @@ async def connect_and_run(relay_url: str, mcp: McpProcess) -> None:
                 break
 
             task: asyncio.Task[None] = asyncio.create_task(
-                handle_relay_message(raw, mcp, ws)
+                handle_relay_message(raw, mcp, ws, tool_timeout)
             )
             pending_tasks.add(task)
             task.add_done_callback(pending_tasks.discard)
@@ -321,6 +343,17 @@ async def main() -> None:
         default=5.0,
         help="Seconds to wait between reconnect attempts (default: 5)",
     )
+    parser.add_argument(
+        "--tool-timeout",
+        type=float,
+        default=120.0,
+        help=(
+            "Seconds to wait for the MCP subprocess to respond to a single "
+            "tool call before giving up (default: 120). Increase this value "
+            "if you need more time to accept the Chrome remote-debugging "
+            "authorisation prompt."
+        ),
+    )
     args = parser.parse_args()
 
     # Build the chrome-devtools-mcp command line.
@@ -347,7 +380,7 @@ async def main() -> None:
                     await mcp.terminate()
                 mcp = await start_mcp_process(mcp_args)
 
-            await connect_and_run(args.relay_url, mcp)
+            await connect_and_run(args.relay_url, mcp, args.tool_timeout)
             log.info(
                 "Disconnected from relay. Reconnecting in %.1fs …",
                 args.reconnect_delay,
