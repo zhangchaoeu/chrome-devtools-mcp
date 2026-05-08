@@ -72,37 +72,72 @@ log = logging.getLogger("connector")
 
 
 # ── MCP subprocess helpers ───────────────────────────────────────────────────
+#
+# chrome-devtools-mcp uses the MCP SDK's StdioServerTransport which frames
+# every JSON-RPC message with an HTTP-style Content-Length header:
+#
+#   Content-Length: <N>\r\n\r\n<JSON body (N bytes, UTF-8)>
+#
+# Both read_from_proc and write_to_proc implement this framing so that the
+# connector speaks the exact same protocol as any other MCP client.
+
+
+async def _read_exactly(
+    reader: asyncio.StreamReader, n: int
+) -> bytes:
+    """Read exactly *n* bytes from *reader*, raising EOFError on short read."""
+    buf = b""
+    while len(buf) < n:
+        chunk = await reader.read(n - len(buf))
+        if not chunk:
+            raise EOFError(
+                f"Subprocess stdout closed after {len(buf)}/{n} bytes"
+            )
+        buf += chunk
+    return buf
 
 
 async def read_from_proc(
     proc: asyncio.subprocess.Process,
 ) -> dict[str, Any]:
     """
-    Read one single-line (newline-delimited) MCP JSON-RPC message from the
-    subprocess stdout. Raises EOFError if the process closes its stdout.
+    Read one Content-Length-framed MCP JSON-RPC message from the subprocess
+    stdout.  Raises EOFError if the process closes its stdout.
     """
     if proc.stdout is None:
         raise RuntimeError("Subprocess has no stdout stream")
 
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            raise EOFError("Subprocess stdout closed unexpectedly")
-        stripped = line.strip()
-        if not stripped:
-            continue
-        return json.loads(stripped)
+    # Read header bytes until we see the blank line (\r\n\r\n).
+    header_bytes = b""
+    while not header_bytes.endswith(b"\r\n\r\n"):
+        ch = await proc.stdout.read(1)
+        if not ch:
+            raise EOFError("Subprocess stdout closed while reading header")
+        header_bytes += ch
+
+    content_length = 0
+    for line in header_bytes.decode("ascii", errors="replace").split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            content_length = int(line.split(":", 1)[1].strip())
+
+    if content_length == 0:
+        return {}
+
+    body = await _read_exactly(proc.stdout, content_length)
+    return json.loads(body)
 
 
 async def write_to_proc(
     proc: asyncio.subprocess.Process, msg: dict[str, Any]
 ) -> None:
-    """Write one MCP JSON-RPC message to the subprocess stdin."""
+    """Write one Content-Length-framed MCP JSON-RPC message to the subprocess
+    stdin."""
     if proc.stdin is None:
         raise RuntimeError("Subprocess has no stdin stream")
 
-    body = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
-    proc.stdin.write(body)
+    body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+    proc.stdin.write(header + body)
     await proc.stdin.drain()
 
 
