@@ -101,7 +101,7 @@ direct `chrome-devtools-mcp` connection.
 MCP Inspector spawns the relay as a subprocess and talks to it over stdio, so
 no extra terminal is needed for it; Inspector handles that automatically.
 
-**Terminal 1 — connector**
+**Terminal 2 — connector**
 
 ```powershell
 # Chrome already open with --remote-debugging-port=9222
