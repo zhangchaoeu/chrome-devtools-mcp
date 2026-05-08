@@ -89,6 +89,42 @@ python connector.py --relay-url ws://33-host:7000 `
 
 The connector reconnects automatically if the relay restarts.
 
+## Local testing on a single machine (MCP Inspector)
+
+You can run both scripts on the same Windows PC to verify the relay without
+needing two separate hosts.  This lets you point **MCP Inspector** (or any
+other MCP client) at the relay and confirm it has identical capabilities to a
+direct `chrome-devtools-mcp` connection.
+
+**Terminal 1 — relay server (MCP Inspector will spawn this)**
+
+MCP Inspector spawns the relay as a subprocess and talks to it over stdio, so
+no extra terminal is needed for it; Inspector handles that automatically.
+
+**Terminal 2 — connector**
+
+```powershell
+# Chrome already open with --remote-debugging-port=9222
+python connector.py --relay-url ws://127.0.0.1:7000 --browser-url http://127.0.0.1:9222
+```
+
+The connector will keep retrying until the relay is up, so you can start it
+before or after Inspector launches the relay.
+
+**MCP Inspector config**
+
+Point MCP Inspector at the relay script using the *stdio* transport:
+
+```json
+{
+  "command": "python",
+  "args": ["C:\\path\\to\\relay_server.py", "--port", "7000", "--host", "127.0.0.1"]
+}
+```
+
+Once connected, MCP Inspector will show the same tool list that
+`chrome-devtools-mcp` exposes directly.
+
 ## Options
 
 ### relay_server.py
