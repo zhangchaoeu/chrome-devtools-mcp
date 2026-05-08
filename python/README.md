@@ -1,8 +1,8 @@
 # Chrome DevTools MCP — Python reverse-tunnel
 
 Two small Python scripts that expose `chrome-devtools-mcp` to an MCP client
-(Hermes, Claude Desktop, etc.) running on a server that **cannot** reach the
-Windows PC directly.
+(Hermes, Claude Desktop, MCP Inspector, etc.) running on a server that
+**cannot** reach the Windows PC directly.
 
 ## Network constraint
 
@@ -14,22 +14,22 @@ PC 32  ◄── Server 33   (33 cannot call 32 ✗)
 ## Architecture
 
 ```
-Hermes (33) ──stdio──► relay_server.py (33)
-                               │
-                       WebSocket server :7000
-                               ▲  ← 32 dials 33
-                       WebSocket client
-                               │
-                        connector.py (32)
-                               │ subprocess stdio
-                      chrome-devtools-mcp (32)
-                               │
-                         Chrome browser (32)
+MCP Client (33) ──stdio or HTTP/SSE──► relay_server.py (33)
+                                               │
+                                       WebSocket server :7000
+                                               ▲  ← 32 dials 33
+                                       WebSocket client
+                                               │
+                                        connector.py (32)
+                                               │ subprocess stdio
+                                      chrome-devtools-mcp (32)
+                                               │
+                                         Chrome browser (32)
 ```
 
 * **`relay_server.py`** — runs on **Server 33**.  
-  Presents a standard MCP stdio interface to Hermes and listens on a WebSocket
-  port for the connector from PC 32.
+  Presents a full MCP server interface (stdio **or** HTTP/SSE) to any MCP
+  client. Listens on a WebSocket port for the reverse connection from PC 32.
 
 * **`connector.py`** — runs on **PC 32** (Windows).  
   Dials the relay on 33, spawns `chrome-devtools-mcp` locally, and proxies
@@ -37,22 +37,25 @@ Hermes (33) ──stdio──► relay_server.py (33)
 
 ## Requirements
 
-Python ≥ 3.11 on both machines (uses `asyncio` from the standard library).
+Python ≥ 3.11 on both machines.
 
 ```bash
-pip install -r requirements.txt   # installs websockets>=13
+pip install -r requirements.txt
+# installs: websockets>=13  mcp>=1.23.0  starlette>=0.49.1  uvicorn>=0.34.2
 ```
 
 ## Quick start
 
 ### 1. Server 33 — start the relay
 
+**stdio mode** (for Claude Desktop / Hermes — they spawn the relay as a
+subprocess):
+
 ```bash
 python relay_server.py --port 7000
 ```
 
-Tell your MCP client to spawn the relay.  
-Example `claude_desktop_config.json` / `server.json` entry:
+Config entry for `claude_desktop_config.json` / `server.json`:
 
 ```json
 {
@@ -64,6 +67,15 @@ Example `claude_desktop_config.json` / `server.json` entry:
   }
 }
 ```
+
+**SSE/HTTP mode** (for MCP Inspector and any HTTP-based MCP client):
+
+```bash
+python relay_server.py --transport sse --http-port 7001 --port 7000
+```
+
+MCP Inspector: select **SSE** transport and enter
+`http://server33:7001/sse` as the URL, then click **Connect**.
 
 ### 2. PC 32 — start the connector
 
@@ -89,41 +101,40 @@ python connector.py --relay-url ws://33-host:7000 `
 
 The connector reconnects automatically if the relay restarts.
 
-## Local testing on a single machine (MCP Inspector)
+## Testing with MCP Inspector (single machine)
 
-You can run both scripts on the same Windows PC to verify the relay without
-needing two separate hosts.  This lets you point **MCP Inspector** (or any
-other MCP client) at the relay and confirm it has identical capabilities to a
-direct `chrome-devtools-mcp` connection.
+You can run both scripts on the same machine to verify the relay end-to-end.
 
-**Terminal 1 — relay server (MCP Inspector will spawn this)**
+**Terminal 1 — relay in SSE mode**
 
-MCP Inspector spawns the relay as a subprocess and talks to it over stdio, so
-no extra terminal is needed for it; Inspector handles that automatically.
+```bash
+python relay_server.py --transport sse --http-port 7001 --port 7000
+```
 
 **Terminal 2 — connector**
 
-```powershell
-# Chrome already open with --remote-debugging-port=9222
+```bash
 python connector.py --relay-url ws://127.0.0.1:7000 --browser-url http://127.0.0.1:9222
 ```
 
-The connector will keep retrying until the relay is up, so you can start it
-before or after Inspector launches the relay.
+**MCP Inspector**
 
-**MCP Inspector config**
-
-Point MCP Inspector at the relay script using the *stdio* transport:
-
-```json
-{
-  "command": "python",
-  "args": ["C:\\path\\to\\relay_server.py", "--port", "7000", "--host", "127.0.0.1"]
-}
+```bash
+npx @modelcontextprotocol/inspector
 ```
 
-Once connected, MCP Inspector will show the same tool list that
-`chrome-devtools-mcp` exposes directly.
+In the Inspector web UI:
+1. Select transport **SSE**
+2. Enter URL `http://127.0.0.1:7001/sse`
+3. Click **Connect**
+
+The Inspector will show the same tool list that `chrome-devtools-mcp` exposes
+directly.
+
+> **stdio mode with MCP Inspector**  
+> Inspector can also spawn the relay directly. Select **stdio** transport,
+> set command to `python` and args to `relay_server.py --port 7000`, then
+> click **Connect**. Start the connector in a separate terminal as above.
 
 ## Options
 
@@ -131,8 +142,11 @@ Once connected, MCP Inspector will show the same tool list that
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--port` | `7000` | WebSocket port for connector connections |
-| `--host` | `0.0.0.0` | Bind interface |
+| `--port` | `7000` | WebSocket port for connector connections from PC 32 |
+| `--host` | `0.0.0.0` | Bind interface for the connector WebSocket server |
+| `--transport` | `stdio` | MCP transport: `stdio` or `sse` |
+| `--http-host` | `0.0.0.0` | Bind address for the HTTP/SSE server (`--transport sse`) |
+| `--http-port` | `7001` | Port for the HTTP/SSE MCP server (`--transport sse`) |
 
 ### connector.py
 
@@ -145,22 +159,23 @@ Once connected, MCP Inspector will show the same tool list that
 | `--auto-connect` | — | Auto-connect to running Chrome |
 | `--user-data-dir` | — | Chrome user-data-dir path |
 | `--reconnect-delay` | `5` | Seconds between reconnect attempts |
+| `--tool-timeout` | `120` | Seconds to wait for a single tool call |
 
 ## How it works
 
-1. Hermes spawns `relay_server.py` via stdio and sends `initialize`.  
-   The relay responds immediately with its own capabilities — no connector
-   needed for the handshake.
+1. The MCP client (Hermes / MCP Inspector) connects to `relay_server.py` over
+   stdio or HTTP/SSE.  The relay uses the **official MCP Python SDK** to handle
+   the initialize handshake and all protocol details correctly.
 
-2. The connector on 32 dials `ws://33-host:7000` and stays connected.
+2. The connector on PC 32 dials `ws://33-host:7000` and stays connected.
 
-3. When Hermes calls `tools/list` or `tools/call`, the relay forwards the
+3. When the client calls `tools/list` or `tools/call`, the relay forwards the
    request over the WebSocket to the connector, awaiting the response.
 
 4. The connector proxies the request to the local `chrome-devtools-mcp`
    subprocess (stdio) and sends the result back through the WebSocket.
 
-5. The relay delivers the result to Hermes as a normal MCP response.
+5. The relay delivers the result to the client as a normal MCP response.
 
 All request/response correlation uses UUIDs so multiple concurrent tool calls
 are handled safely.
