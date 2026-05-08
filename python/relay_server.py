@@ -378,8 +378,7 @@ async def main() -> None:
         else:  # sse
             try:
                 from mcp.server.sse import SseServerTransport
-                from starlette.applications import Starlette
-                from starlette.routing import Mount
+                from starlette.responses import Response
                 from starlette.types import Receive, Scope, Send
                 import uvicorn
             except ImportError as exc:
@@ -393,7 +392,7 @@ async def main() -> None:
             sse_transport = SseServerTransport("/messages/")
             init_opts = server.create_initialization_options()
 
-            async def sse_asgi(
+            async def sse_endpoint(
                 scope: Scope, receive: Receive, send: Send
             ) -> None:
                 async with sse_transport.connect_sse(
@@ -401,15 +400,36 @@ async def main() -> None:
                 ) as streams:
                     await server.run(streams[0], streams[1], init_opts)
 
-            starlette_app = Starlette(
-                routes=[
-                    Mount("/sse", app=sse_asgi),
-                    Mount(
-                        "/messages/",
-                        app=sse_transport.handle_post_message,
-                    ),
-                ]
-            )
+            async def asgi_router(
+                scope: Scope, receive: Receive, send: Send
+            ) -> None:
+                """
+                Minimal ASGI router that does NOT strip path prefixes or
+                modify scope['root_path'].  This ensures SseServerTransport
+                computes the correct client POST URL (/messages/?session_id=…).
+                """
+                if scope["type"] == "lifespan":
+                    event = await receive()
+                    if event["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    event = await receive()
+                    if event["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                    return
+
+                path: str = scope.get("path", "")
+
+                if scope["type"] == "http":
+                    if path == "/sse":
+                        await sse_endpoint(scope, receive, send)
+                    elif path.startswith("/messages"):
+                        await sse_transport.handle_post_message(
+                            scope, receive, send
+                        )
+                    else:
+                        await Response("Not Found", status_code=404)(
+                            scope, receive, send
+                        )
 
             log.info(
                 "Starting relay in SSE mode: http://%s:%d/sse "
@@ -420,7 +440,7 @@ async def main() -> None:
                 args.port,
             )
             uvi_config = uvicorn.Config(
-                starlette_app,
+                asgi_router,
                 host=args.http_host,
                 port=args.http_port,
                 log_level="warning",

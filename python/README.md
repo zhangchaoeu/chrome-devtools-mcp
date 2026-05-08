@@ -161,7 +161,54 @@ directly.
 | `--reconnect-delay` | `5` | Seconds between reconnect attempts |
 | `--tool-timeout` | `120` | Seconds to wait for a single tool call |
 
-## How it works
+## Integration test
+
+A self-contained integration test is included that starts Chrome, the relay, and
+the connector automatically, then runs an MCP Inspector–style SSE client against
+the full chain:
+
+```bash
+# Install test dependency
+pip install 'httpx>=0.27'
+
+# Run the test (auto-starts Chrome headlessly)
+python test_integration.py
+
+# Or point at an already-running Chrome instance
+python test_integration.py --browser-url http://127.0.0.1:9222
+```
+
+Expected output:
+```
+✓ PASS  tools/list returns a list
+✓ PASS  tools/list returns at least 1 tool
+✓ PASS  tools have 'name' field
+✓ PASS  tools have 'inputSchema' field
+✓ PASS  navigate_page returns content
+✓ PASS  second tools/list also works
+Results: 6/6 passed
+```
+
+## Protocol notes
+
+### Stdio framing
+
+`chrome-devtools-mcp` uses `@modelcontextprotocol/sdk` (Node.js) which
+serialises every JSON-RPC message as a **single UTF-8 line terminated with
+`\n`** — plain newline-delimited JSON.  This is *not* the HTTP-style
+Content-Length framing sometimes described in older MCP documentation.
+`connector.py` uses the same newline-delimited format when communicating
+with the subprocess.
+
+### SSE routing
+
+`relay_server.py` uses a pure ASGI router (not Starlette's `Mount`) for the
+SSE transport.  Starlette's `Mount` strips path prefixes and adds them to
+`scope["root_path"]`, which caused `SseServerTransport` to compute wrong
+client POST URLs.  The hand-written ASGI router passes all request paths
+unchanged, so the transport computes `/messages/?session_id=…` correctly.
+
+
 
 1. The MCP client (Hermes / MCP Inspector) connects to `relay_server.py` over
    stdio or HTTP/SSE.  The relay uses the **official MCP Python SDK** to handle
