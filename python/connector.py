@@ -73,11 +73,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
+
+from pydantic import AnyUrl
 
 try:
     from websockets.asyncio.client import connect, ClientConnection
@@ -95,6 +98,7 @@ try:
     from mcp.client.session import ClientSession
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.server import Server
+    from mcp.server.lowlevel.helper_types import ReadResourceContents
     from mcp.server.stdio import stdio_server
 except ImportError:
     print(
@@ -388,8 +392,8 @@ async def connect_and_run(relay_url: str, mcp: McpProcess, tool_timeout: float) 
 
 def build_proxy_server(session: ClientSession) -> Server:
     """
-    Build an MCP Server that proxies list_tools / call_tool through a
-    ClientSession connected to the chrome-devtools-mcp subprocess.
+    Build an MCP Server that proxies all tool, prompt, and resource calls
+    through a ClientSession connected to the chrome-devtools-mcp subprocess.
 
     Using the official mcp SDK on both sides avoids any hand-written
     JSON-RPC parsing or framing.
@@ -407,6 +411,44 @@ def build_proxy_server(session: ClientSession) -> Server:
         arguments: dict[str, Any] | None,
     ) -> mcp_types.CallToolResult:
         return await session.call_tool(name, arguments)
+
+    @proxy.list_prompts()
+    async def list_prompts() -> list[mcp_types.Prompt]:
+        result = await session.list_prompts()
+        return result.prompts
+
+    @proxy.get_prompt()
+    async def get_prompt(
+        name: str,
+        arguments: dict[str, str] | None,
+    ) -> mcp_types.GetPromptResult:
+        return await session.get_prompt(name, arguments)
+
+    @proxy.list_resources()
+    async def list_resources() -> list[mcp_types.Resource]:
+        result = await session.list_resources()
+        return result.resources
+
+    @proxy.read_resource()
+    async def read_resource(uri: AnyUrl) -> Iterable[ReadResourceContents]:
+        result = await session.read_resource(uri)
+        items: list[ReadResourceContents] = []
+        for c in result.contents:
+            if isinstance(c, mcp_types.BlobResourceContents):
+                items.append(
+                    ReadResourceContents(
+                        content=base64.b64decode(c.blob),
+                        mime_type=c.mimeType,
+                    )
+                )
+            else:
+                items.append(
+                    ReadResourceContents(
+                        content=c.text,
+                        mime_type=c.mimeType,
+                    )
+                )
+        return items
 
     return proxy
 
