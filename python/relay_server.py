@@ -46,11 +46,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import sys
 import uuid
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
+
+from pydantic import AnyUrl
 
 try:
     from websockets.asyncio.server import ServerConnection, serve
@@ -66,6 +69,7 @@ except ImportError:
 try:
     import mcp.types as mcp_types
     from mcp.server import Server
+    from mcp.server.lowlevel.helper_types import ReadResourceContents
     from mcp.server.stdio import stdio_server
 except ImportError:
     print(
@@ -294,6 +298,109 @@ def build_mcp_server(state: RelayState) -> Server:
             "tools/call", {"name": name, "arguments": arguments or {}}
         )
         return [_to_content_item(item) for item in result.get("content", [])]
+
+    @server.list_prompts()
+    async def list_prompts() -> list[mcp_types.Prompt]:
+        try:
+            result = await state.forward("prompts/list", {})
+        except ConnectionError as exc:
+            log.warning("prompts/list: no connector connected — %s", exc)
+            return []
+        return [
+            mcp_types.Prompt(
+                name=p["name"],
+                description=p.get("description"),
+                arguments=[
+                    mcp_types.PromptArgument(
+                        name=a["name"],
+                        description=a.get("description"),
+                        required=a.get("required"),
+                    )
+                    for a in p.get("arguments", [])
+                ]
+                if p.get("arguments")
+                else None,
+            )
+            for p in result.get("prompts", [])
+        ]
+
+    @server.get_prompt()
+    async def get_prompt(
+        name: str,
+        arguments: dict[str, str] | None,
+    ) -> mcp_types.GetPromptResult:
+        result = await state.forward(
+            "prompts/get", {"name": name, "arguments": arguments or {}}
+        )
+        messages: list[mcp_types.PromptMessage] = []
+        for msg in result.get("messages", []):
+            raw_content = msg.get("content", {})
+            content_type = raw_content.get("type", "text")
+            if content_type == "image":
+                content: (
+                    mcp_types.TextContent | mcp_types.ImageContent
+                ) = mcp_types.ImageContent(
+                    type="image",
+                    data=raw_content.get("data", ""),
+                    mimeType=raw_content.get("mimeType", "image/png"),
+                )
+            else:
+                content = mcp_types.TextContent(
+                    type="text",
+                    text=raw_content.get(
+                        "text", json.dumps(raw_content, ensure_ascii=False)
+                    ),
+                )
+            messages.append(
+                mcp_types.PromptMessage(
+                    role=msg.get("role", "user"),
+                    content=content,
+                )
+            )
+        return mcp_types.GetPromptResult(
+            description=result.get("description"),
+            messages=messages,
+        )
+
+    @server.list_resources()
+    async def list_resources() -> list[mcp_types.Resource]:
+        try:
+            result = await state.forward("resources/list", {})
+        except ConnectionError as exc:
+            log.warning("resources/list: no connector connected — %s", exc)
+            return []
+        return [
+            mcp_types.Resource(
+                name=r["name"],
+                uri=r["uri"],
+                description=r.get("description"),
+                mimeType=r.get("mimeType"),
+            )
+            for r in result.get("resources", [])
+        ]
+
+    @server.read_resource()
+    async def read_resource(uri: AnyUrl) -> Iterable[ReadResourceContents]:
+        result = await state.forward(
+            "resources/read", {"uri": str(uri)}
+        )
+        items: list[ReadResourceContents] = []
+        for c in result.get("contents", []):
+            if c.get("blob") is not None:
+                items.append(
+                    ReadResourceContents(
+                        content=base64.b64decode(c["blob"]),
+                        mime_type=c.get("mimeType"),
+                    )
+                )
+            else:
+                items.append(
+                    ReadResourceContents(
+                        content=c.get("text", ""),
+                        mime_type=c.get("mimeType"),
+                    )
+                )
+        return items
 
     return server
 
