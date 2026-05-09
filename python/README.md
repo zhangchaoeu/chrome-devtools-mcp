@@ -101,7 +101,30 @@ python connector.py --relay-url ws://33-host:7000 `
 
 The connector reconnects automatically if the relay restarts.
 
-## Testing with MCP Inspector (single machine)
+## Testing with MCP Inspector — local mode (no relay needed)
+
+`connector.py --local-stdin` acts as a full MCP proxy server on its own
+stdin/stdout, so `mcp inspect` can connect to it **directly** without any
+relay or WebSocket server.
+
+```bash
+# Chrome open with --remote-debugging-port=9222
+npx @modelcontextprotocol/inspector python connector.py --local-stdin \
+    --browser-url http://127.0.0.1:9222
+
+# Auto-connect to an existing Chrome profile
+npx @modelcontextprotocol/inspector python connector.py --local-stdin \
+    --auto-connect
+```
+
+In MCP Inspector, select the **stdio** transport, set the command and args to
+match the above, and click **Connect**.
+
+The connector uses the official MCP Python SDK (`ClientSession` +
+`stdio_client`) to talk to the `chrome-devtools-mcp` subprocess, so no
+hand-written JSON-RPC parsing is involved on either side.
+
+## Testing with MCP Inspector (single machine, relay mode)
 
 You can run both scripts on the same machine to verify the relay end-to-end.
 
@@ -152,13 +175,14 @@ directly.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--relay-url` | *(required)* | WebSocket URL of relay, e.g. `ws://192.168.1.33:7000` |
+| `--relay-url` | *(mutually exclusive with `--local-stdin`)* | WebSocket URL of relay, e.g. `ws://192.168.1.33:7000` |
+| `--local-stdin` | *(mutually exclusive with `--relay-url`)* | Run as local stdio MCP proxy for mcp inspect |
 | `--mcp-cmd` | `chrome-devtools-mcp` | Path to the MCP executable |
 | `--browser-url` | — | Chrome DevTools HTTP URL |
 | `--ws-endpoint` | — | Chrome DevTools WebSocket URL |
 | `--auto-connect` | — | Auto-connect to running Chrome |
 | `--user-data-dir` | — | Chrome user-data-dir path |
-| `--reconnect-delay` | `5` | Seconds between reconnect attempts |
+| `--reconnect-delay` | `5` | Seconds between reconnect attempts (relay mode only) |
 | `--tool-timeout` | `120` | Seconds to wait for a single tool call |
 
 ## Integration test
@@ -197,8 +221,11 @@ Results: 6/6 passed
 serialises every JSON-RPC message as a **single UTF-8 line terminated with
 `\n`** — plain newline-delimited JSON.  This is *not* the HTTP-style
 Content-Length framing sometimes described in older MCP documentation.
-`connector.py` uses the same newline-delimited format when communicating
-with the subprocess.
+
+The official MCP Python SDK's `stdio_client` uses the same newline-delimited
+format, so `connector.py --local-stdin` connects to the subprocess without any
+custom transport layer.  In relay mode, `connector.py` uses its own
+newline-delimited framing helpers for the same reason.
 
 ### SSE routing
 
