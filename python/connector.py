@@ -2,53 +2,71 @@
 """
 chrome-devtools connector — runs on PC 32 (Windows machine with Chrome).
 
-Dials the relay server on Server 33 via WebSocket (32 → 33) and forwards
-every MCP request to the locally-running chrome-devtools-mcp process, then
-sends the result back through the same WebSocket channel.
+Two mutually exclusive modes
+-----------------------------
 
-Network topology
-----------------
-  relay_server.py (33)
-       ▲
-  WebSocket (32 dials 33)
-       │
-  connector.py (32, this file)
-       │ subprocess stdio
-  chrome-devtools-mcp  ←→  Chrome DevTools (9222)
+--relay-url  (WebSocket mode, existing)
+  Dials the relay server on Server 33 via WebSocket (32 → 33) and forwards
+  every MCP request to the locally-running chrome-devtools-mcp process, then
+  sends the result back through the same WebSocket channel.
+
+--local-stdin  (local stdio mode, for mcp inspect testing)
+  Acts as a proxy MCP server on its own stdin/stdout (so mcp inspect can
+  connect directly) while forwarding every tool call to the local
+  chrome-devtools-mcp subprocess via the official MCP Python SDK
+  (ClientSession + stdio_client).
+
+Network topologies
+------------------
+  relay mode:
+    relay_server.py (33)
+         ▲
+    WebSocket (32 dials 33)
+         │
+    connector.py (32, this file)
+         │ subprocess stdio
+    chrome-devtools-mcp  ←→  Chrome DevTools (9222)
+
+  local-stdin mode:
+    mcp inspect (or any MCP client)
+         │ stdio
+    connector.py --local-stdin (proxy MCP server on own stdio)
+         │ subprocess stdio (via ClientSession + stdio_client)
+    chrome-devtools-mcp  ←→  Chrome DevTools (9222)
 
 Usage (on PC 32)
 ----------------
-  # Chrome already open with --remote-debugging-port=9222
+  # Relay mode — Chrome already open with --remote-debugging-port=9222
   python connector.py --relay-url ws://33-host:7000 --browser-url http://127.0.0.1:9222
 
-  # Let chrome-devtools-mcp auto-connect to an existing Chrome profile
+  # Relay mode — auto-connect to a running Chrome instance
   python connector.py --relay-url ws://33-host:7000 --auto-connect
 
-  # Specify a Chrome user-data-dir
-  python connector.py --relay-url ws://33-host:7000 \
-      --user-data-dir "C:\\Users\\Me\\AppData\\Local\\Google\\Chrome\\User Data"
+  # Local stdio mode for mcp inspect (no relay needed)
+  python connector.py --local-stdin --browser-url http://127.0.0.1:9222
 
 Options
 -------
-  --relay-url        WebSocket URL of the relay server on 33 (required)
+  --relay-url        WebSocket URL of the relay server on 33
+  --local-stdin      Run as a local stdio MCP proxy (mutually exclusive with --relay-url)
   --mcp-cmd          chrome-devtools-mcp executable (default: chrome-devtools-mcp)
   --browser-url      Chrome DevTools HTTP URL, e.g. http://127.0.0.1:9222
   --ws-endpoint      Chrome DevTools WebSocket URL
   --auto-connect     Auto-connect to a running Chrome instance
   --user-data-dir    Chrome user-data-dir path
-  --reconnect-delay  Seconds between reconnect attempts (default: 5)
+  --reconnect-delay  Seconds between reconnect attempts (default: 5, relay mode only)
 
 Requirements
 ------------
-  pip install "websockets>=13"
+  pip install "websockets>=13" "mcp>=1.23.0"
 
 Protocol note
 -------------
   chrome-devtools-mcp uses @modelcontextprotocol/sdk (Node.js) which serialises
   every JSON-RPC message as a single UTF-8 line terminated with \\n.  This is
   *different* from the HTTP-style Content-Length framing sometimes described in
-  older MCP documentation.  All reads from / writes to the subprocess therefore
-  use newline-delimited JSON.
+  older MCP documentation.  The official MCP Python SDK's stdio_client uses the
+  same newline-delimited JSON framing, so it is fully compatible.
 """
 
 from __future__ import annotations
@@ -68,6 +86,20 @@ except ImportError:
     print(
         "ERROR: websockets package not found (need >= 13). Install it with:\n"
         "  pip install 'websockets>=13'",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+try:
+    import mcp.types as mcp_types
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import stdio_client, StdioServerParameters
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+except ImportError:
+    print(
+        "ERROR: mcp package not found (need >= 1.23.0). Install it with:\n"
+        "  pip install 'mcp>=1.23.0'",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -351,6 +383,82 @@ async def connect_and_run(relay_url: str, mcp: McpProcess, tool_timeout: float) 
             await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
+# ── Local stdio mode (SDK-based proxy) ───────────────────────────────────────
+
+
+def build_proxy_server(session: ClientSession) -> Server:
+    """
+    Build an MCP Server that proxies list_tools / call_tool through a
+    ClientSession connected to the chrome-devtools-mcp subprocess.
+
+    Using the official mcp SDK on both sides avoids any hand-written
+    JSON-RPC parsing or framing.
+    """
+    proxy: Server = Server("chrome-devtools-proxy")
+
+    @proxy.list_tools()
+    async def list_tools() -> list[mcp_types.Tool]:
+        result = await session.list_tools()
+        return result.tools
+
+    @proxy.call_tool()
+    async def call_tool(
+        name: str,
+        arguments: dict[str, Any] | None,
+    ) -> mcp_types.CallToolResult:
+        return await session.call_tool(name, arguments)
+
+    return proxy
+
+
+async def run_local_stdin_mode(mcp_args: list[str]) -> None:
+    """
+    Run the connector in local stdio mode.
+
+    mcp inspect (or any MCP client) communicates with this process via its
+    own stdin/stdout.  The connector spawns chrome-devtools-mcp as a
+    subprocess and bridges all tool calls through the official SDK's
+    ClientSession (stdio_client).
+
+    chrome-devtools-mcp uses newline-delimited JSON framing, which is the
+    same framing used by the SDK's stdio_client, so no custom transport is
+    needed.
+    """
+    cmd = mcp_args[0]
+    sub_args = mcp_args[1:]
+
+    server_params = StdioServerParameters(command=cmd, args=sub_args)
+    log.info(
+        "Starting local stdin mode — subprocess: %s", " ".join(mcp_args)
+    )
+
+    async with stdio_client(server_params, errlog=sys.stderr) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            client_info=mcp_types.Implementation(
+                name="chrome-devtools-connector",
+                version="0.1.0",
+            ),
+        ) as session:
+            await session.initialize()
+            log.info(
+                "Connected to chrome-devtools-mcp via SDK — "
+                "ready to serve mcp inspect"
+            )
+
+            proxy = build_proxy_server(session)
+            async with stdio_server() as (srv_read, srv_write):
+                await proxy.run(
+                    srv_read,
+                    srv_write,
+                    proxy.create_initialization_options(),
+                )
+
+
 # ── Main reconnect loop ───────────────────────────────────────────────────────
 
 
@@ -358,15 +466,26 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "chrome-devtools connector (PC 32 side). "
-            "Dials the relay on Server 33 and forwards MCP requests to the "
-            "local chrome-devtools-mcp process."
+            "Either dials the relay on Server 33 (--relay-url) or acts as a "
+            "local stdio MCP proxy for mcp inspect (--local-stdin)."
         )
     )
-    parser.add_argument(
+
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
         "--relay-url",
-        required=True,
         help="WebSocket URL of the relay server on Server 33, e.g. ws://192.168.1.33:7000",
     )
+    mode_group.add_argument(
+        "--local-stdin",
+        action="store_true",
+        help=(
+            "Run as a local stdio MCP proxy. "
+            "mcp inspect (or any MCP client) can connect via stdio. "
+            "Mutually exclusive with --relay-url."
+        ),
+    )
+
     parser.add_argument(
         "--mcp-cmd",
         default="chrome-devtools-mcp",
@@ -393,7 +512,7 @@ async def main() -> None:
         "--reconnect-delay",
         type=float,
         default=5.0,
-        help="Seconds to wait between reconnect attempts (default: 5)",
+        help="Seconds to wait between reconnect attempts (default: 5, relay mode only)",
     )
     parser.add_argument(
         "--tool-timeout",
@@ -419,6 +538,15 @@ async def main() -> None:
     if args.user_data_dir:
         mcp_args += ["--user-data-dir", args.user_data_dir]
 
+    # ── Local stdio mode ──────────────────────────────────────────────────────
+    if args.local_stdin:
+        try:
+            await run_local_stdin_mode(mcp_args)
+        except KeyboardInterrupt:
+            log.info("Interrupted — shutting down")
+        return
+
+    # ── Relay (WebSocket) mode ────────────────────────────────────────────────
     # Start the MCP subprocess once; restart it only if it dies.
     mcp: Optional[McpProcess] = None
 
