@@ -13,17 +13,19 @@ PC 32  ◄── Server 33   (33 cannot call 32 ✗)
 ## Architecture
 
 ```
-MCP Agent (33) ──HTTP/SSE──► relay_server.py (33)
-                                      │ tools/list & tools/call only
-                              WebSocket server :7000
-                                      ▲  ← 32 dials 33
-                              WebSocket client
-                                      │
-                               connector.py (32)
-                                      │ subprocess stdio (initialize + tools)
-                             chrome-devtools-mcp (32)
-                                      │
-                                Chrome browser (32)
+MCP Agent (Claude Desktop / any stdio MCP host)
+       │ stdio (spawns relay_server.py as a subprocess)
+relay_server.py (33)
+       │ tools/list & tools/call only
+WebSocket server :7000
+       ▲  ← 32 dials 33
+WebSocket client
+       │
+connector.py (32)
+       │ subprocess stdio (initialize + tools)
+chrome-devtools-mcp (32)
+       │
+ Chrome browser (32)
 ```
 
 **Two independent MCP sessions**
@@ -58,21 +60,48 @@ The connector has a single lightweight dependency and is ready to use out of the
 
 ```bash
 pip install -r requirements.txt
-# installs: websockets>=13  mcp>=1.23.0  fastapi>=0.100.0  uvicorn>=0.34.2
+# installs: websockets>=13  mcp>=1.23.0
 ```
 
 ## Quick start
 
-### 1. Server 33 — start the relay
+### 1. Server 33 — configure the relay as a stdio MCP server
 
-The relay always runs as an HTTP/SSE server (FastAPI + uvicorn):
+The relay runs as a **stdio** MCP server — your agent host (e.g. Claude Desktop)
+launches it as a subprocess and communicates over stdin/stdout.
 
-```bash
-python relay_server.py --port 7000 --http-port 7001
+Add it to your agent config. For **Claude Desktop**
+(`~/.claude/claude_desktop_config.json` on macOS/Linux,
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "python",
+      "args": ["/path/to/relay_server.py", "--port", "7000"]
+    }
+  }
+}
 ```
 
-MCP Inspector or any HTTP-based MCP client: select **SSE** transport and enter
-`http://server33:7001/sse` as the URL, then click **Connect**.
+The relay will start automatically when the agent host launches and will listen
+on WebSocket port 7000 for the connector from PC 32.
+
+**Testing the relay without an agent host:**
+
+```bash
+# Start the connector first (Terminal 2 below), then pipe JSON-RPC manually
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}' \
+  | python relay_server.py --port 7000
+```
+
+Or use [MCP Inspector](https://github.com/modelcontextprotocol/inspector) in
+**stdio** mode:
+
+```bash
+npx @modelcontextprotocol/inspector python relay_server.py --port 7000
+```
 
 ### 2. PC 32 — start the connector
 
@@ -108,28 +137,19 @@ The connector:
 
 Run both scripts on the same machine to verify the relay end-to-end.
 
-**Terminal 1 — relay**
-
-```bash
-python relay_server.py --http-port 7001 --port 7000 --http-host 127.0.0.1 --host 127.0.0.1
-```
-
-**Terminal 2 — connector**
+**Terminal 1 — connector**
 
 ```bash
 python connector.py --relay-url ws://127.0.0.1:7000 --browser-url http://127.0.0.1:9222
 ```
 
-**MCP Inspector**
+**MCP Inspector (stdio mode)**
 
 ```bash
-npx @modelcontextprotocol/inspector
+npx @modelcontextprotocol/inspector python relay_server.py --port 7000 --host 127.0.0.1
 ```
 
-In the Inspector web UI:
-1. Select transport **SSE**
-2. Enter URL `http://127.0.0.1:7001/sse`
-3. Click **Connect**
+The Inspector launches the relay as a subprocess and communicates over stdio.
 
 ## Options
 
@@ -139,8 +159,6 @@ In the Inspector web UI:
 |--------|---------|-------------|
 | `--port` | `7000` | WebSocket port for connector connections from PC 32 |
 | `--host` | `0.0.0.0` | Bind interface for the connector WebSocket server |
-| `--http-host` | `0.0.0.0` | Bind address for the HTTP/SSE server |
-| `--http-port` | `7001` | Port for the HTTP/SSE MCP server |
 
 ### connector.py
 
@@ -206,7 +224,7 @@ subprocess, so no special transport layer is needed.
 
 **When an agent connects to the relay:**
 
-1. The agent sends an MCP `initialize` request to `relay_server.py` over HTTP/SSE.
+1. The agent host launches `relay_server.py` as a subprocess and sends an MCP `initialize` request over stdio.
 2. The relay responds with its own `initialize` response (capabilities, server info) — handled entirely by the MCP Python SDK, without contacting the connector.
 3. The agent sends `notifications/initialized`; the relay acknowledges — session with the agent is now ready.
 
