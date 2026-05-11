@@ -143,15 +143,30 @@ class RelayState:
         payload = json.dumps(
             {"id": req_id, "method": method, "params": params}
         )
+        log.debug(
+            "relay->connector  id=%s  method=%s  payload=%s",
+            req_id,
+            method,
+            payload,
+        )
         await connector.send(payload)
-        return await fut
+        result = await fut
+        log.debug(
+            "connector->relay  id=%s  method=%s  result_keys=%s",
+            req_id,
+            method,
+            list(result.keys()),
+        )
+        return result
 
     async def resolve(self, data: dict[str, Any]) -> None:
         """Resolve a pending future from a message sent by the connector."""
         req_id = data.get("id")
         if not req_id:
+            log.debug("connector->relay  message without id (ignored): %r", str(data)[:200])
             return
 
+        log.debug("connector->relay  raw response id=%s", req_id)
         async with self._lock:
             fut = self._pending.pop(req_id, None)
 
@@ -160,6 +175,7 @@ class RelayState:
             return
 
         if "error" in data:
+            log.warning("connector->relay  error for id=%s: %s", req_id, data["error"])
             fut.set_exception(RuntimeError(str(data["error"])))
         else:
             fut.set_result(data.get("result", {}))
@@ -173,9 +189,12 @@ async def handle_connector(
     state: RelayState,
 ) -> None:
     """Called once per incoming WebSocket connection from the connector on 32."""
+    remote = websocket.remote_address
+    log.info("Connector connected from %s", remote)
     await state.set_connector(websocket)
     try:
         async for raw in websocket:
+            log.debug("connector->relay  raw frame: %r", str(raw)[:500])
             try:
                 data = json.loads(raw)
                 await state.resolve(data)
@@ -241,12 +260,15 @@ def build_mcp_server(state: RelayState) -> Server:
 
     @server.list_tools()
     async def list_tools() -> list[mcp_types.Tool]:
+        log.info("tools/list requested by MCP agent")
         try:
             result = await state.forward("tools/list", {})
         except ConnectionError as exc:
             log.warning("tools/list: no connector connected -- %s", exc)
             return []
         tools = result.get("tools", [])
+        log.info("tools/list: returning %d tool(s)", len(tools))
+        log.debug("tools/list: names=%s", [t.get("name") for t in tools])
         return [
             mcp_types.Tool(
                 name=t["name"],
@@ -267,10 +289,13 @@ def build_mcp_server(state: RelayState) -> Server:
         | mcp_types.ImageContent
         | mcp_types.EmbeddedResource
     ]:
+        log.info("tools/call  name=%s  arguments=%r", name, arguments)
         result = await state.forward(
             "tools/call", {"name": name, "arguments": arguments or {}}
         )
-        return [_to_content_item(item) for item in result.get("content", [])]
+        content = result.get("content", [])
+        log.debug("tools/call  name=%s  content_items=%d", name, len(content))
+        return [_to_content_item(item) for item in content]
 
     return server
 
@@ -328,7 +353,15 @@ def main() -> None:
         default="0.0.0.0",
         help="Bind interface for the connector WebSocket server (default: 0.0.0.0)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG-level logging (logs all WS and stdio message content)",
+    )
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     log.info(
         "Starting relay: stdio MCP server, connector WS on ws://%s:%d",

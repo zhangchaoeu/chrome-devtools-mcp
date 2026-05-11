@@ -106,7 +106,9 @@ async def read_from_proc(
         if not chunk:
             raise EOFError("Subprocess stdout closed")
         if chunk.strip():
-            return json.loads(chunk.decode("utf-8"))
+            parsed = json.loads(chunk.decode("utf-8"))
+            log.debug("mcp->connector  stdout: %s", chunk.decode("utf-8").rstrip())
+            return parsed
         if time.monotonic() >= deadline:
             raise TimeoutError("deadline exceeded while reading subprocess")
 
@@ -119,6 +121,7 @@ async def write_to_proc(
         raise RuntimeError("Subprocess has no stdin stream")
 
     line = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+    log.debug("connector->mcp  stdin: %s", line.decode("utf-8").rstrip())
     proc.stdin.write(line)
     await proc.stdin.drain()
 
@@ -286,6 +289,7 @@ async def handle_relay_message(
     send the response back over the WebSocket.
     """
     text = raw if isinstance(raw, str) else raw.decode("utf-8")
+    log.debug("relay->connector  raw WS frame: %r", text[:500])
     try:
         req = json.loads(text)
     except json.JSONDecodeError:
@@ -305,6 +309,12 @@ async def handle_relay_message(
 
     try:
         result = await mcp.call(req_id_str, method, params, timeout=tool_timeout)
+        log.debug(
+            "relay->connector  id=%s  method=%s  result_keys=%s",
+            req_id_str,
+            method,
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+        )
         response: dict[str, Any] = {"id": req_id, "result": result}
     except RuntimeError as exc:
         msg = str(exc)
@@ -412,7 +422,15 @@ async def main() -> None:
             "tool call before giving up (default: 120)."
         ),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG-level logging (logs all WS and stdio message content)",
+    )
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     mcp_args = [args.mcp_cmd]
     if args.browser_url:
