@@ -3,13 +3,13 @@
 chrome-devtools relay server -- runs on Server 33.
 
 Accepts a reverse WebSocket connection from connector.py on PC 32 and
-exposes tools/list and tools/call to MCP agents via stdio.
+exposes tools/list and tools/call to MCP agents via HTTP/SSE (FastAPI).
 
 Network topology
 ----------------
-  MCP Agent (Claude Desktop / any MCP host)
-       | stdio (launches relay_server.py as a subprocess)
-  relay_server.py (33, this file)
+  MCP Agent (Hermes / Claude / any MCP host)
+       | HTTP SSE  GET /sse  +  POST /messages
+  relay_server.py (33, this file -- FastAPI + uvicorn)
        |
        WebSocket server :7000
        ^ <- 32 dials 33
@@ -23,35 +23,26 @@ Network topology
 
 Usage (on Server 33)
 --------------------
-  Configure relay_server.py as a stdio MCP server in your agent host, e.g.
-  Claude Desktop (~/.claude/claude_desktop_config.json):
+  python relay_server.py --port 7000 --http-port 8000
 
-    {
-      "mcpServers": {
-        "chrome-devtools": {
-          "command": "python",
-          "args": ["/path/to/relay_server.py", "--port", "7000"]
-        }
-      }
-    }
-
-  The agent host launches this script as a subprocess; the connector from
-  PC 32 dials in on the WebSocket port independently.
+  Then point your MCP client at:  http://<server33>:8000/sse
 
 Requirements
 ------------
   pip install -r requirements.txt
-  # websockets>=13  mcp>=1.23.0
+  # websockets>=13  mcp>=1.23.0  fastapi>=0.110.0  uvicorn>=0.29.0
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 try:
@@ -68,11 +59,22 @@ except ImportError:
 try:
     import mcp.types as mcp_types
     from mcp.server import Server
-    from mcp.server.stdio import stdio_server
+    from mcp.server.sse import SseServerTransport
 except ImportError:
     print(
         "ERROR: mcp package not found (need >= 1.23.0). Install it with:\n"
         "  pip install 'mcp>=1.23.0'",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+try:
+    import uvicorn
+    from fastapi import FastAPI, Request
+except ImportError:
+    print(
+        "ERROR: fastapi/uvicorn not found. Install with:\n"
+        "  pip install 'fastapi>=0.110.0' 'uvicorn>=0.29.0'",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -287,32 +289,96 @@ async def run_ws_server(state: RelayState, host: str, port: int) -> None:
         await asyncio.get_running_loop().create_future()
 
 
+# -- FastAPI / SSE app -------------------------------------------------------
+
+
+def make_app(state: RelayState, ws_host: str, ws_port: int) -> Any:
+    """
+    Build the ASGI application that serves MCP over HTTP/SSE via FastAPI.
+
+    Routing
+    -------
+    GET  /sse       -- SSE stream; MCP clients connect here
+    POST /messages  -- MCP client POSTs JSON-RPC messages here (session_id in query)
+
+    The /messages path is handled by a thin ASGI wrapper *around* the FastAPI
+    app to avoid Starlette's Mount stripping the path prefix and corrupting
+    the client POST URL that SseServerTransport advertises.
+    """
+    mcp_server = build_mcp_server(state)
+    init_opts = mcp_server.create_initialization_options()
+    sse_transport = SseServerTransport("/messages/")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> Any:
+        ws_task = asyncio.create_task(run_ws_server(state, ws_host, ws_port))
+        log.info("WebSocket connector server started")
+        yield
+        ws_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ws_task
+        log.info("WebSocket connector server stopped")
+
+    fastapi_app: FastAPI = FastAPI(
+        title="chrome-devtools-relay", lifespan=lifespan
+    )
+
+    @fastapi_app.get("/sse")
+    async def sse_endpoint(request: Request) -> None:
+        async with sse_transport.connect_sse(
+            request.scope, request.receive, request._send
+        ) as (read, write):
+            await mcp_server.run(read, write, init_opts)
+
+    # Wrap FastAPI so that /messages/* goes directly to the SSE transport
+    # without passing through Starlette's Mount (which modifies root_path and
+    # breaks the endpoint URL the transport advertises to clients).
+    async def asgi_app(scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and scope.get("path", "").startswith(
+            "/messages"
+        ):
+            await sse_transport.handle_post_message(scope, receive, send)
+        else:
+            await fastapi_app(scope, receive, send)
+
+    return asgi_app
+
+
 # -- Entry point -------------------------------------------------------------
 
 
-async def run_relay(ws_host: str, ws_port: int) -> None:
-    """Start the WebSocket connector server and serve MCP over stdio."""
+async def run_relay(
+    ws_host: str, ws_port: int, http_host: str, http_port: int
+) -> None:
+    """Start the HTTP/SSE MCP server (FastAPI) with the WebSocket connector server."""
     state = RelayState()
-    server = build_mcp_server(state)
-    init_opts = server.create_initialization_options()
+    app = make_app(state, ws_host, ws_port)
 
-    ws_task = asyncio.create_task(run_ws_server(state, ws_host, ws_port))
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, init_opts)
-    finally:
-        ws_task.cancel()
-        try:
-            await ws_task
-        except asyncio.CancelledError:
-            pass
+    log.info(
+        "Starting relay: HTTP/SSE MCP on http://%s:%d/sse, "
+        "connector WS on ws://%s:%d",
+        http_host,
+        http_port,
+        ws_host,
+        ws_port,
+    )
+
+    config = uvicorn.Config(
+        app,
+        host=http_host,
+        port=http_port,
+        log_level="info",
+        loop="none",
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "chrome-devtools relay (Server 33 side). "
-            "Presents tools/list and tools/call via MCP over stdio and "
+            "Exposes MCP tools via HTTP/SSE (FastAPI) and "
             "forwards requests to the connector on PC 32 via a reverse "
             "WebSocket tunnel."
         )
@@ -328,14 +394,20 @@ def main() -> None:
         default="0.0.0.0",
         help="Bind interface for the connector WebSocket server (default: 0.0.0.0)",
     )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=8000,
+        help="HTTP port for MCP agents to connect via SSE (default: 8000)",
+    )
+    parser.add_argument(
+        "--http-host",
+        default="0.0.0.0",
+        help="Bind interface for the HTTP/SSE server (default: 0.0.0.0)",
+    )
     args = parser.parse_args()
 
-    log.info(
-        "Starting relay: stdio MCP server, connector WS on ws://%s:%d",
-        args.host,
-        args.port,
-    )
-    asyncio.run(run_relay(args.host, args.port))
+    asyncio.run(run_relay(args.host, args.port, args.http_host, args.http_port))
 
 
 if __name__ == "__main__":
