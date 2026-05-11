@@ -1,8 +1,7 @@
 # Chrome DevTools MCP — Python reverse-tunnel
 
-Two small Python scripts that expose `chrome-devtools-mcp` to an MCP client
-(Hermes, Claude Desktop, MCP Inspector, etc.) running on a server that
-**cannot** reach the Windows PC directly.
+Two small Python scripts that expose `chrome-devtools-mcp` to an MCP agent
+running on a server that **cannot** reach the Windows PC directly.
 
 ## Network constraint
 
@@ -14,78 +13,71 @@ PC 32  ◄── Server 33   (33 cannot call 32 ✗)
 ## Architecture
 
 ```
-MCP Client (33) ──stdio or HTTP/SSE──► relay_server.py (33)
-                                               │
-                                       WebSocket server :7000
-                                               ▲  ← 32 dials 33
-                                       WebSocket client
-                                               │
-                                        connector.py (32)
-                                               │ subprocess stdio
-                                      chrome-devtools-mcp (32)
-                                               │
-                                         Chrome browser (32)
+MCP Agent (33) ──HTTP/SSE──► relay_server.py (33)
+                                      │ tools/list & tools/call only
+                              WebSocket server :7000
+                                      ▲  ← 32 dials 33
+                              WebSocket client
+                                      │
+                               connector.py (32)
+                                      │ subprocess stdio (initialize + tools)
+                             chrome-devtools-mcp (32)
+                                      │
+                                Chrome browser (32)
 ```
 
-* **`relay_server.py`** — runs on **Server 33**.  
-  Presents a full MCP server interface (stdio **or** HTTP/SSE) to any MCP
-  client. Listens on a WebSocket port for the reverse connection from PC 32.
+**Division of labour**
 
-* **`connector.py`** — runs on **PC 32** (Windows).  
-  Dials the relay on 33, spawns `chrome-devtools-mcp` locally, and proxies
-  every MCP request/response through the tunnel.
+| Component | Responsibility |
+|-----------|---------------|
+| **`connector.py`** (PC 32) | Spawns `chrome-devtools-mcp`, performs the MCP `initialize` handshake, and proxies `tools/list` and `tools/call` requests from the relay to Chrome |
+| **`relay_server.py`** (Server 33) | Listens on a WebSocket port for the connector's reverse connection, then exposes `tools/list` and `tools/call` to agents via HTTP/SSE |
+
+The relay only ever forwards two MCP methods. All MCP protocol overhead
+(`initialize`, `notifications/initialized`, capability negotiation, etc.) is
+handled entirely by the connector — the relay never sees it.
 
 ## Requirements
 
 Python ≥ 3.11 on both machines.
 
+**PC 32 (connector only)**
+
+```bash
+pip install "websockets>=13"
+```
+
+The connector has a single lightweight dependency and is ready to use out of the box.
+
+**Server 33 (relay)**
+
 ```bash
 pip install -r requirements.txt
-# installs: websockets>=13  mcp>=1.23.0  starlette>=0.49.1  uvicorn>=0.34.2
+# installs: websockets>=13  mcp>=1.23.0  fastapi>=0.100.0  uvicorn>=0.34.2
 ```
 
 ## Quick start
 
 ### 1. Server 33 — start the relay
 
-**stdio mode** (for Claude Desktop / Hermes — they spawn the relay as a
-subprocess):
+The relay always runs as an HTTP/SSE server (FastAPI + uvicorn):
 
 ```bash
-python relay_server.py --port 7000
+python relay_server.py --port 7000 --http-port 7001
 ```
 
-Config entry for `claude_desktop_config.json` / `server.json`:
-
-```json
-{
-  "mcpServers": {
-    "chrome_devtools": {
-      "command": "python",
-      "args": ["/path/to/relay_server.py", "--port", "7000"]
-    }
-  }
-}
-```
-
-**SSE/HTTP mode** (for MCP Inspector and any HTTP-based MCP client):
-
-```bash
-python relay_server.py --transport sse --http-port 7001 --port 7000
-```
-
-MCP Inspector: select **SSE** transport and enter
+MCP Inspector or any HTTP-based MCP client: select **SSE** transport and enter
 `http://server33:7001/sse` as the URL, then click **Connect**.
 
 ### 2. PC 32 — start the connector
 
-First make sure `chrome-devtools-mcp` is installed:
+Make sure `chrome-devtools-mcp` is installed and Chrome is running:
 
 ```powershell
 npm install -g chrome-devtools-mcp
 ```
 
-Then start the connector:
+Then start the connector (only `websockets` needed):
 
 ```powershell
 # Chrome open with --remote-debugging-port=9222
@@ -99,39 +91,22 @@ python connector.py --relay-url ws://33-host:7000 `
     --user-data-dir "C:\Users\Me\AppData\Local\Google\Chrome\User Data"
 ```
 
-The connector reconnects automatically if the relay restarts.
+The connector:
+1. Spawns `chrome-devtools-mcp` as a subprocess
+2. Completes the MCP `initialize` handshake with the subprocess
+3. Dials the relay at `--relay-url` and stays connected
+4. On each `tools/list` or `tools/call` from the relay, forwards the request
+   to the subprocess and sends the result back — reconnecting automatically
+   if the relay restarts
 
-## Testing with MCP Inspector — local mode (no relay needed)
+## Testing with MCP Inspector (single machine)
 
-`connector.py --local-stdin` acts as a full MCP proxy server on its own
-stdin/stdout, so `mcp inspect` can connect to it **directly** without any
-relay or WebSocket server.
+Run both scripts on the same machine to verify the relay end-to-end.
 
-```bash
-# Chrome open with --remote-debugging-port=9222
-npx @modelcontextprotocol/inspector python connector.py --local-stdin \
-    --browser-url http://127.0.0.1:9222
-
-# Auto-connect to an existing Chrome profile
-npx @modelcontextprotocol/inspector python connector.py --local-stdin \
-    --auto-connect
-```
-
-In MCP Inspector, select the **stdio** transport, set the command and args to
-match the above, and click **Connect**.
-
-The connector uses the official MCP Python SDK (`ClientSession` +
-`stdio_client`) to talk to the `chrome-devtools-mcp` subprocess, so no
-hand-written JSON-RPC parsing is involved on either side.
-
-## Testing with MCP Inspector (single machine, relay mode)
-
-You can run both scripts on the same machine to verify the relay end-to-end.
-
-**Terminal 1 — relay in SSE mode**
+**Terminal 1 — relay**
 
 ```bash
-python relay_server.py --transport sse --http-port 7001 --port 7000
+python relay_server.py --http-port 7001 --port 7000 --http-host 127.0.0.1 --host 127.0.0.1
 ```
 
 **Terminal 2 — connector**
@@ -151,14 +126,6 @@ In the Inspector web UI:
 2. Enter URL `http://127.0.0.1:7001/sse`
 3. Click **Connect**
 
-The Inspector will show the same tool list that `chrome-devtools-mcp` exposes
-directly.
-
-> **stdio mode with MCP Inspector**  
-> Inspector can also spawn the relay directly. Select **stdio** transport,
-> set command to `python` and args to `relay_server.py --port 7000`, then
-> click **Connect**. Start the connector in a separate terminal as above.
-
 ## Options
 
 ### relay_server.py
@@ -167,29 +134,26 @@ directly.
 |--------|---------|-------------|
 | `--port` | `7000` | WebSocket port for connector connections from PC 32 |
 | `--host` | `0.0.0.0` | Bind interface for the connector WebSocket server |
-| `--transport` | `stdio` | MCP transport: `stdio` or `sse` |
-| `--http-host` | `0.0.0.0` | Bind address for the HTTP/SSE server (`--transport sse`) |
-| `--http-port` | `7001` | Port for the HTTP/SSE MCP server (`--transport sse`) |
+| `--http-host` | `0.0.0.0` | Bind address for the HTTP/SSE server |
+| `--http-port` | `7001` | Port for the HTTP/SSE MCP server |
 
 ### connector.py
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--relay-url` | *(mutually exclusive with `--local-stdin`)* | WebSocket URL of relay, e.g. `ws://192.168.1.33:7000` |
-| `--local-stdin` | *(mutually exclusive with `--relay-url`)* | Run as local stdio MCP proxy for mcp inspect |
-| `--mcp-cmd` | `chrome-devtools-mcp` | Path to the MCP executable |
-| `--browser-url` | — | Chrome DevTools HTTP URL |
+| `--relay-url` | *(required)* | WebSocket URL of relay, e.g. `ws://192.168.1.33:7000` |
+| `--mcp-cmd` | `chrome-devtools-mcp` | Path to the `chrome-devtools-mcp` executable |
+| `--browser-url` | — | Chrome DevTools HTTP URL, e.g. `http://127.0.0.1:9222` |
 | `--ws-endpoint` | — | Chrome DevTools WebSocket URL |
-| `--auto-connect` | — | Auto-connect to running Chrome |
+| `--auto-connect` | — | Auto-connect to a running Chrome instance |
 | `--user-data-dir` | — | Chrome user-data-dir path |
-| `--reconnect-delay` | `5` | Seconds between reconnect attempts (relay mode only) |
-| `--tool-timeout` | `120` | Seconds to wait for a single tool call |
+| `--reconnect-delay` | `5` | Seconds between WebSocket reconnect attempts |
+| `--tool-timeout` | `120` | Seconds to wait for a single tool call response |
 
 ## Integration test
 
-A self-contained integration test is included that starts Chrome, the relay, and
-the connector automatically, then runs an MCP Inspector–style SSE client against
-the full chain:
+A self-contained integration test starts the relay and connector automatically,
+then runs an MCP Inspector–style SSE client against the full chain:
 
 ```bash
 # Install test dependency
@@ -219,37 +183,25 @@ Results: 6/6 passed
 
 `chrome-devtools-mcp` uses `@modelcontextprotocol/sdk` (Node.js) which
 serialises every JSON-RPC message as a **single UTF-8 line terminated with
-`\n`** — plain newline-delimited JSON.  This is *not* the HTTP-style
-Content-Length framing sometimes described in older MCP documentation.
+`\n`** — plain newline-delimited JSON, not the HTTP-style Content-Length
+framing sometimes described in older MCP documentation.
 
-The official MCP Python SDK's `stdio_client` uses the same newline-delimited
-format, so `connector.py --local-stdin` connects to the subprocess without any
-custom transport layer.  In relay mode, `connector.py` uses its own
-newline-delimited framing helpers for the same reason.
+`connector.py` uses the same newline-delimited framing when talking to the
+subprocess, so no special transport layer is needed.
 
-### SSE routing
+### How a tool call flows
 
-`relay_server.py` uses a pure ASGI router (not Starlette's `Mount`) for the
-SSE transport.  Starlette's `Mount` strips path prefixes and adds them to
-`scope["root_path"]`, which caused `SseServerTransport` to compute wrong
-client POST URLs.  The hand-written ASGI router passes all request paths
-unchanged, so the transport computes `/messages/?session_id=…` correctly.
-
-
-
-1. The MCP client (Hermes / MCP Inspector) connects to `relay_server.py` over
-   stdio or HTTP/SSE.  The relay uses the **official MCP Python SDK** to handle
-   the initialize handshake and all protocol details correctly.
-
-2. The connector on PC 32 dials `ws://33-host:7000` and stays connected.
-
-3. When the client calls `tools/list` or `tools/call`, the relay forwards the
-   request over the WebSocket to the connector, awaiting the response.
-
-4. The connector proxies the request to the local `chrome-devtools-mcp`
-   subprocess (stdio) and sends the result back through the WebSocket.
-
-5. The relay delivers the result to the client as a normal MCP response.
+1. The agent calls `tools/list` or `tools/call` on the relay over HTTP/SSE.
+2. The relay assigns a UUID to the request and sends it to the connector over
+   the WebSocket.
+3. The connector translates the request into a JSON-RPC message and writes it
+   to `chrome-devtools-mcp`'s stdin.
+4. `chrome-devtools-mcp` executes the tool in Chrome and writes the result to
+   stdout.
+5. The connector reads the result, wraps it with the original UUID, and sends
+   it back over the WebSocket.
+6. The relay resolves the pending future and returns the result to the agent.
 
 All request/response correlation uses UUIDs so multiple concurrent tool calls
 are handled safely.
+
