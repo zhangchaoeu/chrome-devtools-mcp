@@ -318,6 +318,21 @@ async def start_mcp_process(mcp_args: list[str]) -> McpProcess:
     return McpProcess(proc)
 
 
+# ── Optional MCP methods handled locally ─────────────────────────────────────
+#
+# chrome-devtools-mcp only implements tools/list and tools/call.  Some MCP
+# clients unconditionally probe for prompts and resources regardless of the
+# server capabilities advertised during initialisation.  Forwarding those
+# requests to the subprocess produces noisy "Method not found" errors.
+# Return stub responses locally so the subprocess never sees them.
+
+_STUB_RESULTS: dict[str, dict[str, Any]] = {
+    "prompts/list": {"prompts": []},
+    "resources/list": {"resources": []},
+    "resources/templates/list": {"resourceTemplates": []},
+}
+
+
 # ── Per-message handler ───────────────────────────────────────────────────────
 
 
@@ -338,13 +353,63 @@ async def handle_relay_message(
         log.warning("Non-JSON message from relay: %r", text[:200])
         return
 
-    req_id: str = req.get("id", "")
+    req_id = req.get("id")
     method: str = req.get("method", "")
     params: dict[str, Any] = req.get("params") or {}
 
+    # Notifications (no "id") are fire-and-forget — nothing to reply to.
+    if req_id is None:
+        log.debug("Relay notification: %s", method)
+        return
+
+    req_id_str = str(req_id)
+
+    # Handle optional capability methods locally; the subprocess only
+    # implements tools, so these would otherwise return "Method not found".
+    if method in _STUB_RESULTS:
+        await ws.send(
+            json.dumps(
+                {"id": req_id, "result": _STUB_RESULTS[method]},
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    if method == "prompts/get":
+        name = params.get("name", "")
+        await ws.send(
+            json.dumps(
+                {
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Prompt not found: {name}",
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
     try:
-        result = await mcp.call(req_id, method, params, timeout=tool_timeout)
+        result = await mcp.call(req_id_str, method, params, timeout=tool_timeout)
         response: dict[str, Any] = {"id": req_id, "result": result}
+    except RuntimeError as exc:
+        msg = str(exc)
+        # McpProcess.call() serialises the subprocess error object as JSON.
+        # If the code is -32601 (Method not found) log at WARNING instead of
+        # ERROR so it doesn't pollute monitoring dashboards.
+        parsed: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(msg)
+        except json.JSONDecodeError:
+            pass
+        if isinstance(parsed, dict) and parsed.get("code") == -32601:
+            log.warning("Unhandled MCP method=%s: %s", method, msg)
+            response = {"id": req_id, "error": parsed}
+        else:
+            log.exception("MCP subprocess error for method=%s", method)
+            response = {"id": req_id, "error": {"code": -32603, "message": msg}}
     except Exception as exc:
         log.exception("MCP subprocess error for method=%s", method)
         response = {
