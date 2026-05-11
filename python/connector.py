@@ -396,25 +396,20 @@ async def handle_relay_message(
         response: dict[str, Any] = {"id": req_id, "result": result}
     except RuntimeError as exc:
         msg = str(exc)
-        # -32601 means the subprocess doesn't implement this method; log at
-        # WARNING rather than ERROR so it doesn't pollute monitoring dashboards.
+        # McpProcess.call() serialises the subprocess error object as JSON.
+        # If the code is -32601 (Method not found) log at WARNING instead of
+        # ERROR so it doesn't pollute monitoring dashboards.
+        parsed: dict[str, Any] | None = None
         try:
-            err_obj = json.loads(msg)
-            if isinstance(err_obj, dict) and err_obj.get("code") == -32601:
-                log.warning("Unhandled MCP method=%s: %s", method, msg)
-                response = {"id": req_id, "error": err_obj}
-            else:
-                log.exception("MCP subprocess error for method=%s", method)
-                response = {
-                    "id": req_id,
-                    "error": {"code": -32603, "message": msg},
-                }
+            parsed = json.loads(msg)
         except json.JSONDecodeError:
+            pass
+        if isinstance(parsed, dict) and parsed.get("code") == -32601:
+            log.warning("Unhandled MCP method=%s: %s", method, msg)
+            response = {"id": req_id, "error": parsed}
+        else:
             log.exception("MCP subprocess error for method=%s", method)
-            response = {
-                "id": req_id,
-                "error": {"code": -32603, "message": msg},
-            }
+            response = {"id": req_id, "error": {"code": -32603, "message": msg}}
     except Exception as exc:
         log.exception("MCP subprocess error for method=%s", method)
         response = {
