@@ -93,10 +93,35 @@ class RelayState:
     Holds the active connector WebSocket and a map of in-flight request futures.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, connector_timeout: float = 30.0) -> None:
         self._connector: Optional[ServerConnection] = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
+        # Signalled whenever a connector is present; cleared when it leaves.
+        self._connected = asyncio.Event()
+        self.connector_timeout = connector_timeout
+
+    async def wait_for_connector(self) -> None:
+        """
+        Block until a connector is registered or connector_timeout seconds
+        elapse.  Raises ConnectionError on timeout.
+        """
+        if self._connected.is_set():
+            return
+        log.info(
+            "Waiting up to %.1fs for connector to connect ...",
+            self.connector_timeout,
+        )
+        try:
+            await asyncio.wait_for(
+                self._connected.wait(), timeout=self.connector_timeout
+            )
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"No connector connected after {self.connector_timeout:.0f}s. "
+                "Start connector.py on PC 32 first."
+            )
+        log.info("Connector is now available, proceeding")
 
     async def set_connector(self, ws: ServerConnection) -> None:
         async with self._lock:
@@ -110,6 +135,7 @@ class RelayState:
                     pass
             else:
                 self._connector = ws
+        self._connected.set()
         log.info("Connector registered")
 
     async def clear_connector(self) -> None:
@@ -121,6 +147,7 @@ class RelayState:
                         ConnectionError("Connector disconnected unexpectedly")
                     )
             self._pending.clear()
+        self._connected.clear()
         log.info("Connector unregistered")
 
     async def forward(
@@ -262,9 +289,10 @@ def build_mcp_server(state: RelayState) -> Server:
     async def list_tools() -> list[mcp_types.Tool]:
         log.info("tools/list requested by MCP agent")
         try:
+            await state.wait_for_connector()
             result = await state.forward("tools/list", {})
         except ConnectionError as exc:
-            log.warning("tools/list: no connector connected -- %s", exc)
+            log.warning("tools/list: connector not available -- %s", exc)
             return []
         tools = result.get("tools", [])
         log.info("tools/list: returning %d tool(s)", len(tools))
@@ -315,9 +343,9 @@ async def run_ws_server(state: RelayState, host: str, port: int) -> None:
 # -- Entry point -------------------------------------------------------------
 
 
-async def run_relay(ws_host: str, ws_port: int) -> None:
+async def run_relay(ws_host: str, ws_port: int, connector_timeout: float) -> None:
     """Start the WebSocket connector server and serve MCP over stdio."""
-    state = RelayState()
+    state = RelayState(connector_timeout=connector_timeout)
     server = build_mcp_server(state)
     init_opts = server.create_initialization_options()
 
@@ -354,6 +382,15 @@ def main() -> None:
         help="Bind interface for the connector WebSocket server (default: 0.0.0.0)",
     )
     parser.add_argument(
+        "--connector-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "Seconds to wait for the PC 32 connector to connect before "
+            "giving up on a tools/list request (default: 30)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable DEBUG-level logging (logs all WS and stdio message content)",
@@ -364,11 +401,12 @@ def main() -> None:
         logging.getLogger().setLevel(logging.DEBUG)
 
     log.info(
-        "Starting relay: stdio MCP server, connector WS on ws://%s:%d",
+        "Starting relay: stdio MCP server, connector WS on ws://%s:%d, connector-timeout=%.1fs",
         args.host,
         args.port,
+        args.connector_timeout,
     )
-    asyncio.run(run_relay(args.host, args.port))
+    asyncio.run(run_relay(args.host, args.port, args.connector_timeout))
 
 
 if __name__ == "__main__":
