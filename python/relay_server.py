@@ -40,7 +40,7 @@ import logging
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional
 
 try:
     from websockets.asyncio.server import ServerConnection, serve
@@ -298,7 +298,7 @@ def make_app(state: RelayState, ws_host: str, ws_port: int) -> FastAPI:
     sse_transport = SseServerTransport("/messages/")
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):  # type: ignore[type-arg]
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         ws_task = asyncio.create_task(run_ws_server(state, ws_host, ws_port))
         try:
             yield
@@ -311,7 +311,7 @@ def make_app(state: RelayState, ws_host: str, ws_port: int) -> FastAPI:
 
     async def sse_endpoint(request: Request) -> Response:
         async with sse_transport.connect_sse(
-            request.scope, request.receive, request._send  # type: ignore[attr-defined]
+            request.scope, request.receive, getattr(request, "_send")
         ) as streams:
             await server.run(streams[0], streams[1], init_opts)
         return Response()
