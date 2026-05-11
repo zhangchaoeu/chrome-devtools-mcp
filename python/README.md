@@ -26,16 +26,21 @@ MCP Agent (33) ──HTTP/SSE──► relay_server.py (33)
                                 Chrome browser (32)
 ```
 
-**Division of labour**
+**Two independent MCP sessions**
 
-| Component | Responsibility |
-|-----------|---------------|
-| **`connector.py`** (PC 32) | Spawns `chrome-devtools-mcp`, performs the MCP `initialize` handshake, and proxies `tools/list` and `tools/call` requests from the relay to Chrome |
-| **`relay_server.py`** (Server 33) | Listens on a WebSocket port for the connector's reverse connection, then exposes `tools/list` and `tools/call` to agents via HTTP/SSE |
+There are two separate MCP sessions in play, each with its own full lifecycle:
 
-The relay only ever forwards two MCP methods. All MCP protocol overhead
-(`initialize`, `notifications/initialized`, capability negotiation, etc.) is
-handled entirely by the connector — the relay never sees it.
+| Session | Between | Who handles it |
+|---------|---------|----------------|
+| **Agent ↔ Relay** | MCP agent on Server 33 ↔ `relay_server.py` | **`relay_server.py`** is a fully compliant MCP server: it handles the MCP `initialize` request, returns the `initialize` response with server info and capabilities, and processes the `notifications/initialized` notification to mark the session ready |
+| **Connector ↔ subprocess** | `connector.py` ↔ `chrome-devtools-mcp` | **`connector.py`** owns the full MCP `initialize` handshake with the subprocess before accepting any requests from the relay |
+
+**What the relay sends to the connector (over WebSocket) is exactly two things:**
+
+- `tools/list` — when the agent queries available tools
+- `tools/call` — when the agent invokes a tool
+
+Everything else in the agent-facing MCP session (`initialize`, `notifications/initialized`, capability negotiation, error handling) is managed by the relay itself using the MCP Python SDK. The connector is never involved in those steps.
 
 ## Requirements
 
@@ -189,17 +194,29 @@ framing sometimes described in older MCP documentation.
 `connector.py` uses the same newline-delimited framing when talking to the
 subprocess, so no special transport layer is needed.
 
-### How a tool call flows
+### How the full flow works
 
-1. The agent calls `tools/list` or `tools/call` on the relay over HTTP/SSE.
-2. The relay assigns a UUID to the request and sends it to the connector over
-   the WebSocket.
-3. The connector translates the request into a JSON-RPC message and writes it
-   to `chrome-devtools-mcp`'s stdin.
-4. `chrome-devtools-mcp` executes the tool in Chrome and writes the result to
-   stdout.
-5. The connector reads the result, wraps it with the original UUID, and sends
-   it back over the WebSocket.
+**On connector startup (once, before any agent request):**
+
+1. `connector.py` spawns `chrome-devtools-mcp` as a subprocess.
+2. The connector sends an MCP `initialize` request to the subprocess.
+3. The subprocess replies with its `initialize` response (capabilities, server info).
+4. The connector sends `notifications/initialized` to mark the session ready.
+5. The connector dials `ws://relay-host:7000` and holds the WebSocket open.
+
+**When an agent connects to the relay:**
+
+1. The agent sends an MCP `initialize` request to `relay_server.py` over HTTP/SSE.
+2. The relay responds with its own `initialize` response (capabilities, server info) — handled entirely by the MCP Python SDK, without contacting the connector.
+3. The agent sends `notifications/initialized`; the relay acknowledges — session with the agent is now ready.
+
+**On each tool request (agent → relay → connector → subprocess):**
+
+1. The agent calls `tools/list` or `tools/call` on the relay.
+2. The relay assigns a UUID to the request and sends it to the connector over the WebSocket.
+3. The connector writes the corresponding JSON-RPC request to the subprocess's stdin.
+4. `chrome-devtools-mcp` executes the tool in Chrome and writes the result to stdout.
+5. The connector reads the result, attaches the original UUID, and sends it back over the WebSocket.
 6. The relay resolves the pending future and returns the result to the agent.
 
 All request/response correlation uses UUIDs so multiple concurrent tool calls
