@@ -69,7 +69,6 @@ try:
     import uvicorn
     from fastapi import FastAPI, Request
     from starlette.responses import Response
-    from starlette.routing import Mount, Route
 except ImportError as exc:
     print(
         f"ERROR: Required packages not found: {exc}\n"
@@ -309,16 +308,20 @@ def make_app(state: RelayState, ws_host: str, ws_port: int) -> FastAPI:
             except asyncio.CancelledError:
                 pass
 
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/sse")
     async def sse_endpoint(request: Request) -> Response:
+        # SseServerTransport.connect_sse needs the raw ASGI send callable.
+        # Starlette stores it on Request._send (set in Request.__init__).
+        # This is the same pattern used by the official FastMCP SDK.
         async with sse_transport.connect_sse(
-            request.scope, request.receive, getattr(request, "_send")
+            request.scope, request.receive, request._send  # noqa: SLF001
         ) as streams:
             await server.run(streams[0], streams[1], init_opts)
         return Response()
 
-    app = FastAPI(lifespan=lifespan)
-    app.router.routes.insert(0, Route("/sse", endpoint=sse_endpoint, methods=["GET"]))
-    app.router.routes.insert(1, Mount("/messages", app=sse_transport.handle_post_message))
+    app.mount("/messages", sse_transport.handle_post_message)
     return app
 
 
