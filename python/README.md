@@ -32,10 +32,10 @@ chrome-devtools-mcp (32)
 
 There are two separate MCP sessions in play, each with its own full lifecycle:
 
-| Session | Between | Who handles it |
-|---------|---------|----------------|
-| **Agent ↔ Relay** | MCP agent on Server 33 ↔ `relay_server.py` | **`relay_server.py`** is a fully compliant MCP server: it handles the MCP `initialize` request, returns the `initialize` response with server info and capabilities, and processes the `notifications/initialized` notification to mark the session ready |
-| **Connector ↔ subprocess** | `connector.py` ↔ `chrome-devtools-mcp` | **`connector.py`** owns the full MCP `initialize` handshake with the subprocess before accepting any requests from the relay |
+| Session                    | Between                                    | Who handles it                                                                                                                                                                                                                                            |
+| -------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Agent ↔ Relay**          | MCP agent on Server 33 ↔ `relay_server.py` | **`relay_server.py`** is a fully compliant MCP server: it handles the MCP `initialize` request, returns the `initialize` response with server info and capabilities, and processes the `notifications/initialized` notification to mark the session ready |
+| **Connector ↔ subprocess** | `connector.py` ↔ `chrome-devtools-mcp`     | **`connector.py`** owns the full MCP `initialize` handshake with the subprocess before accepting any requests from the relay                                                                                                                              |
 
 **What the relay sends to the connector (over WebSocket) is exactly two things:**
 
@@ -126,6 +126,7 @@ python connector.py --relay-url ws://33-host:7000 `
 ```
 
 The connector:
+
 1. Spawns `chrome-devtools-mcp` as a subprocess
 2. Completes the MCP `initialize` handshake with the subprocess
 3. Dials the relay at `--relay-url` and stays connected
@@ -155,23 +156,23 @@ The Inspector launches the relay as a subprocess and communicates over stdio.
 
 ### relay_server.py
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--port` | `7000` | WebSocket port for connector connections from PC 32 |
-| `--host` | `0.0.0.0` | Bind interface for the connector WebSocket server |
+| Option   | Default   | Description                                         |
+| -------- | --------- | --------------------------------------------------- |
+| `--port` | `7000`    | WebSocket port for connector connections from PC 32 |
+| `--host` | `0.0.0.0` | Bind interface for the connector WebSocket server   |
 
 ### connector.py
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--relay-url` | *(required)* | WebSocket URL of relay, e.g. `ws://192.168.1.33:7000` |
-| `--mcp-cmd` | `chrome-devtools-mcp` | Path to the `chrome-devtools-mcp` executable |
-| `--browser-url` | — | Chrome DevTools HTTP URL, e.g. `http://127.0.0.1:9222` |
-| `--ws-endpoint` | — | Chrome DevTools WebSocket URL |
-| `--auto-connect` | — | Auto-connect to a running Chrome instance |
-| `--user-data-dir` | — | Chrome user-data-dir path |
-| `--reconnect-delay` | `5` | Seconds between WebSocket reconnect attempts |
-| `--tool-timeout` | `120` | Seconds to wait for a single tool call response |
+| Option              | Default               | Description                                            |
+| ------------------- | --------------------- | ------------------------------------------------------ |
+| `--relay-url`       | _(required)_          | WebSocket URL of relay, e.g. `ws://192.168.1.33:7000`  |
+| `--mcp-cmd`         | `chrome-devtools-mcp` | Path to the `chrome-devtools-mcp` executable           |
+| `--browser-url`     | —                     | Chrome DevTools HTTP URL, e.g. `http://127.0.0.1:9222` |
+| `--ws-endpoint`     | —                     | Chrome DevTools WebSocket URL                          |
+| `--auto-connect`    | —                     | Auto-connect to a running Chrome instance              |
+| `--user-data-dir`   | —                     | Chrome user-data-dir path                              |
+| `--reconnect-delay` | `5`                   | Seconds between WebSocket reconnect attempts           |
+| `--tool-timeout`    | `120`                 | Seconds to wait for a single tool call response        |
 
 ## Integration test
 
@@ -190,6 +191,7 @@ python test_integration.py --browser-url http://127.0.0.1:9222
 ```
 
 Expected output:
+
 ```
 ✓ PASS  tools/list returns a list
 ✓ PASS  tools/list returns at least 1 tool
@@ -239,4 +241,3 @@ subprocess, so no special transport layer is needed.
 
 All request/response correlation uses UUIDs so multiple concurrent tool calls
 are handled safely.
-

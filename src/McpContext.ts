@@ -59,6 +59,13 @@ interface McpContextOptions {
 
 const DEFAULT_TIMEOUT = 5_000;
 const NAVIGATION_TIMEOUT = 10_000;
+// Puppeteer's CDP connection has a default 180-second timeout for commands
+// like Target.getDevToolsTarget.  That is longer than the connector's
+// 120-second tool timeout, so a slow Chrome response can cause the MCP
+// subprocess to be killed before it ever replies.  Cap each per-page check
+// to DEFAULT_TIMEOUT so the whole detectOpenDevToolsWindows pass completes
+// well within the connector's timeout budget.
+const DEVTOOLS_CHECK_TIMEOUT_MS = DEFAULT_TIMEOUT;
 
 export class McpContext implements Context {
   browser: Browser;
@@ -639,7 +646,7 @@ export class McpContext implements Context {
   }
 
   async detectOpenDevToolsWindows() {
-    this.logger('Detecting open DevTools windows');
+    this.logger('detectOpenDevToolsWindows: start');
     const {pages} = await this.#getAllPages();
 
     await Promise.all(
@@ -649,20 +656,75 @@ export class McpContext implements Context {
           return;
         }
 
+        const pageUrl = page.url();
+        const checkStart = Date.now();
+        this.logger(
+          'detectOpenDevToolsWindows: checking page id=%d url=%s',
+          mcpPage.id,
+          pageUrl,
+        );
+
         // Prior to Chrome 144.0.7559.59, the command fails,
         // Some Electron apps still use older version
         // Fall back to not exposing DevTools at all.
+        //
+        // hasDevTools() / openDevTools() call Target.getDevToolsTarget on the
+        // browser-level CDP connection whose default timeout is 180 s.  That
+        // exceeds the connector's 120 s tool timeout, so a non-responsive
+        // Chrome would cause the whole MCP process to be killed before it
+        // could reply.  Wrap every call in a hard cap so the pass always
+        // completes quickly regardless of Chrome's response time.
         try {
-          if (await page.hasDevTools()) {
-            mcpPage.devToolsPage = await page.openDevTools();
+          const hasDevTools = await Promise.race([
+            page.hasDevTools(),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      `hasDevTools timed out after ${DEVTOOLS_CHECK_TIMEOUT_MS}ms`,
+                    ),
+                  ),
+                DEVTOOLS_CHECK_TIMEOUT_MS,
+              ),
+            ),
+          ]);
+          if (hasDevTools) {
+            mcpPage.devToolsPage = await Promise.race([
+              page.openDevTools(),
+              new Promise<never>((_, reject) =>
+                setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        `openDevTools timed out after ${DEVTOOLS_CHECK_TIMEOUT_MS}ms`,
+                      ),
+                    ),
+                  DEVTOOLS_CHECK_TIMEOUT_MS,
+                ),
+              ),
+            ]);
           } else {
             mcpPage.devToolsPage = undefined;
           }
-        } catch {
+          this.logger(
+            'detectOpenDevToolsWindows: page id=%d done in %dms hasDevTools=%s',
+            mcpPage.id,
+            Date.now() - checkStart,
+            hasDevTools,
+          );
+        } catch (e) {
+          this.logger(
+            'detectOpenDevToolsWindows: page id=%d failed in %dms: %s',
+            mcpPage.id,
+            Date.now() - checkStart,
+            e,
+          );
           mcpPage.devToolsPage = undefined;
         }
       }),
     );
+    this.logger('detectOpenDevToolsWindows: done');
   }
 
   getExtensionServiceWorkers(): ExtensionServiceWorker[] {

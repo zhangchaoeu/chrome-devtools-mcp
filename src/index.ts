@@ -282,9 +282,16 @@ export async function createMcpServer(
         let success = false;
         try {
           logger(`${tool.name} request: ${JSON.stringify(params, null, '  ')}`);
+          logger(`${tool.name} getContext: start`);
           const context = await getContext();
           logger(`${tool.name} context: resolved`);
+          const detectStart = Date.now();
+          logger(`${tool.name} detectOpenDevToolsWindows: start`);
           await context.detectOpenDevToolsWindows();
+          logger(
+            `${tool.name} detectOpenDevToolsWindows: done in %dms`,
+            Date.now() - detectStart,
+          );
           const response = serverArgs.slim
             ? new SlimMcpResponse(serverArgs)
             : new McpResponse(serverArgs);
@@ -302,6 +309,8 @@ export async function createMcpServer(
               page.throwIfDialogOpen();
             }
             if ('pageScoped' in tool && tool.pageScoped) {
+              const handlerStart = Date.now();
+              logger(`${tool.name} handler: start`);
               await tool.handler(
                 {
                   params,
@@ -310,7 +319,13 @@ export async function createMcpServer(
                 response,
                 context,
               );
+              logger(
+                `${tool.name} handler: done in %dms`,
+                Date.now() - handlerStart,
+              );
             } else {
+              const handlerStart = Date.now();
+              logger(`${tool.name} handler: start`);
               await tool.handler(
                 // @ts-expect-error types do not match.
                 {
@@ -319,13 +334,23 @@ export async function createMcpServer(
                 response,
                 context,
               );
+              logger(
+                `${tool.name} handler: done in %dms`,
+                Date.now() - handlerStart,
+              );
             }
           } catch (err) {
             response.setError(err);
           }
+          const responseHandleStart = Date.now();
+          logger(`${tool.name} response.handle: start`);
           const {content, structuredContent} = await response.handle(
             tool.name,
             context,
+          );
+          logger(
+            `${tool.name} response.handle: done in %dms`,
+            Date.now() - responseHandleStart,
           );
           const result: CallToolResult & {
             structuredContent?: Record<string, unknown>;

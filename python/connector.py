@@ -156,7 +156,19 @@ class McpProcess:
         matching response are silently dropped.  Raises RuntimeError on
         subprocess error responses and TimeoutError on timeout.
         """
+        if self._lock.locked():
+            log.warning(
+                "connector->mcp  id=%s method=%s  lock contention: another "
+                "request is already in-flight; queuing behind it",
+                req_id,
+                method,
+            )
         async with self._lock:
+            log.debug(
+                "connector->mcp  id=%s method=%s  lock acquired, forwarding",
+                req_id,
+                method,
+            )
             msg: dict[str, Any] = {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -166,10 +178,19 @@ class McpProcess:
             await write_to_proc(self._proc, msg)
 
             deadline = time.monotonic() + timeout
+            call_start = time.monotonic()
             while True:
                 try:
                     resp = await read_from_proc(self._proc, deadline)
                 except TimeoutError:
+                    elapsed = time.monotonic() - call_start
+                    log.error(
+                        "connector->mcp  id=%s method=%s  no response in "
+                        "%.0fs -- terminating subprocess",
+                        req_id,
+                        method,
+                        elapsed,
+                    )
                     await self.terminate()
                     raise RuntimeError(
                         f"MCP subprocess did not respond within {timeout:.0f}s. "
@@ -194,6 +215,13 @@ class McpProcess:
                     continue
                 break
 
+        elapsed = time.monotonic() - call_start
+        log.debug(
+            "connector->mcp  id=%s method=%s  response received in %.2fs",
+            req_id,
+            method,
+            elapsed,
+        )
         if "error" in resp:
             raise RuntimeError(
                 json.dumps(resp["error"], ensure_ascii=False)
@@ -313,7 +341,7 @@ async def handle_relay_message(
             "relay->connector  id=%s  method=%s  result_keys=%s",
             req_id_str,
             method,
-            list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+            list(result.keys()) if isinstance(result, dict) else f'<{type(result).__name__}>',
         )
         response: dict[str, Any] = {"id": req_id, "result": result}
     except RuntimeError as exc:
@@ -337,6 +365,12 @@ async def handle_relay_message(
         }
 
     await ws.send(json.dumps(response, ensure_ascii=False))
+    log.debug(
+        "connector->relay  id=%s method=%s  response sent (%s)",
+        req_id_str,
+        method,
+        "error" if "error" in response else "success",
+    )
 
 
 # -- WebSocket connect-and-run loop ------------------------------------------
@@ -365,6 +399,10 @@ async def connect_and_run(relay_url: str, mcp: McpProcess, tool_timeout: float) 
             task.add_done_callback(pending_tasks.discard)
 
         if pending_tasks:
+            log.debug(
+                "Waiting for %d in-flight task(s) to finish before disconnect",
+                len(pending_tasks),
+            )
             await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
