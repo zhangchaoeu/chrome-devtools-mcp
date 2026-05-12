@@ -368,8 +368,8 @@ async def run_tests(mcp_cmd: str, browser_url: str) -> bool:
             [
                 sys.executable,
                 RELAY_SCRIPT,
-                "--transport", "sse",
                 "--port", str(RELAY_WS_PORT),
+                "--transport", "sse",
                 "--http-port", str(RELAY_HTTP_PORT),
                 "--http-host", "127.0.0.1",
                 "--host", "127.0.0.1",
