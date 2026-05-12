@@ -7,9 +7,12 @@ exposes tools/list and tools/call to MCP agents via stdio.
 
 Network topology
 ----------------
-  MCP Agent (Claude Desktop / any MCP host)
-       | stdio (launches relay_server.py as a subprocess)
-  relay_server.py (33, this file)
+  MCP Agent A        MCP Agent B   (multiple agents OK)
+       | stdio             | stdio
+  relay_server.py    relay_server.py  ← secondary: bridges to primary via UNIX socket
+  (primary, 33)      (secondary, 33)
+       |                   |
+       +-------------------+  /tmp/relay-{port}.sock
        |
        WebSocket server :7000
        ^ <- 32 dials 33
@@ -20,6 +23,15 @@ Network topology
   chrome-devtools-mcp (32)
        |
   Chrome browser (32)
+
+Multi-agent support
+-------------------
+  The first relay_server.py that starts becomes the *primary*: it binds the
+  WebSocket port and creates a UNIX-domain socket at /tmp/relay-{port}.sock.
+
+  Every subsequent relay_server.py detects the primary via that UNIX socket and
+  becomes a *secondary*: it bridges its own stdin/stdout to the primary over the
+  UNIX socket, so all agents share the same connector WebSocket connection.
 
 Usage (on Server 33)
 --------------------
@@ -50,9 +62,14 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import uuid
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
+
+import anyio
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 try:
     from websockets.asyncio.server import ServerConnection, serve
@@ -69,6 +86,7 @@ try:
     import mcp.types as mcp_types
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
+    from mcp.shared.message import SessionMessage
 except ImportError:
     print(
         "ERROR: mcp package not found (need >= 1.23.0). Install it with:\n"
@@ -328,9 +346,197 @@ def build_mcp_server(state: RelayState) -> Server:
     return server
 
 
+# -- Multi-instance support: primary/secondary via UNIX socket ---------------
+
+
+def _sock_path(port: int) -> str:
+    """UNIX-domain socket path used to share a primary relay with secondaries."""
+    return f"/tmp/relay-{port}.sock"
+
+
+async def _check_if_primary(sock_path: str) -> bool:
+    """
+    Return True if this process should run as primary (no live relay found).
+    Return False if another relay is already listening on *sock_path*.
+    """
+    try:
+        _, writer = await asyncio.open_unix_connection(sock_path)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return False  # connected → we are a secondary
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        return True   # no relay present → we are the primary
+
+
+@asynccontextmanager
+async def _unix_socket_mcp_session(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> AsyncIterator[
+    tuple[
+        MemoryObjectReceiveStream[SessionMessage | Exception],
+        MemoryObjectSendStream[SessionMessage],
+    ]
+]:
+    """
+    Wrap an asyncio UNIX-socket stream pair as anyio MCP memory-object streams,
+    mirroring what ``mcp.server.stdio.stdio_server()`` does for stdin/stdout.
+    """
+    read_stream_writer: MemoryObjectSendStream[SessionMessage | Exception]
+    read_stream: MemoryObjectReceiveStream[SessionMessage | Exception]
+    write_stream: MemoryObjectSendStream[SessionMessage]
+    write_stream_reader: MemoryObjectReceiveStream[SessionMessage]
+
+    read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
+    write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
+
+    async def socket_reader() -> None:
+        async with read_stream_writer:
+            while True:
+                line_bytes = await reader.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    message = mcp_types.JSONRPCMessage.model_validate_json(line)
+                    await read_stream_writer.send(SessionMessage(message))
+                except Exception as exc:
+                    await read_stream_writer.send(exc)
+
+    async def socket_writer() -> None:
+        async with write_stream_reader:
+            async for session_message in write_stream_reader:
+                json_str = session_message.message.model_dump_json(
+                    by_alias=True, exclude_none=True
+                )
+                writer.write((json_str + "\n").encode("utf-8"))
+                await writer.drain()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(socket_reader)
+        tg.start_soon(socket_writer)
+        try:
+            yield read_stream, write_stream
+        finally:
+            tg.cancel_scope.cancel()
+
+
+async def _handle_unix_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    server: Server,
+    init_opts: Any,
+) -> None:
+    """Serve one secondary relay as an independent MCP session over a UNIX socket."""
+    log.info("Secondary relay connected via UNIX socket")
+    try:
+        async with _unix_socket_mcp_session(reader, writer) as (
+            read_stream,
+            write_stream,
+        ):
+            await server.run(read_stream, write_stream, init_opts)
+    except Exception as exc:
+        log.info("Secondary relay session ended: %s", exc)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+    log.info("Secondary relay disconnected")
+
+
+async def _run_unix_socket_server(
+    sock_path: str,
+    server: Server,
+    init_opts: Any,
+) -> None:
+    """
+    Listen on *sock_path* and serve each connecting secondary relay as an
+    independent MCP session, all backed by the same :class:`RelayState`.
+    """
+    # Remove a stale socket file left by a crashed previous primary.
+    try:
+        os.unlink(sock_path)
+    except FileNotFoundError:
+        pass
+
+    async def client_cb(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await _handle_unix_client(reader, writer, server, init_opts)
+
+    unix_server = await asyncio.start_unix_server(client_cb, path=sock_path)
+    log.info("Secondary-relay UNIX socket listening at %s", sock_path)
+    async with unix_server:
+        await unix_server.serve_forever()
+
+
+async def _run_secondary(sock_path: str) -> None:
+    """
+    Secondary mode: bridge this process's stdin/stdout to the primary relay
+    over its UNIX socket so that both Hermes instances share one connector.
+    """
+    log.info("Secondary mode: bridging stdio → primary relay at %s", sock_path)
+    reader, writer = await asyncio.open_unix_connection(sock_path)
+
+    stdin_buf = sys.stdin.buffer
+    stdout_buf = sys.stdout.buffer
+
+    async def stdin_to_socket() -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                # read1() returns whatever is buffered (up to N bytes) without
+                # waiting for more; run in executor so we don't block the loop.
+                chunk = await loop.run_in_executor(None, stdin_buf.read1, 65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        except Exception as exc:
+            log.debug("stdin→socket bridge ended: %s", exc)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def socket_to_stdout() -> None:
+        try:
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                stdout_buf.write(chunk)
+                stdout_buf.flush()
+        except Exception as exc:
+            log.debug("socket→stdout bridge ended: %s", exc)
+
+    # Run both directions; stop as soon as either side closes.
+    loop = asyncio.get_running_loop()
+    stdin_task = loop.create_task(stdin_to_socket())
+    stdout_task = loop.create_task(socket_to_stdout())
+    done, pending = await asyncio.wait(
+        [stdin_task, stdout_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+    log.info("Secondary relay bridge closed")
+
+
 # -- WebSocket connector server ----------------------------------------------
-
-
 async def run_ws_server(state: RelayState, host: str, port: int) -> None:
     """Run the reverse-tunnel WebSocket server that PC 32 dials into."""
     async with serve(lambda ws: handle_connector(ws, state), host, port):
@@ -344,20 +550,49 @@ async def run_ws_server(state: RelayState, host: str, port: int) -> None:
 
 
 async def run_relay(ws_host: str, ws_port: int, connector_timeout: float) -> None:
-    """Start the WebSocket connector server and serve MCP over stdio."""
+    """
+    Start the relay.
+
+    If no other relay is running on this port, become the *primary*: start the
+    WebSocket server, open a UNIX-socket server for secondaries, and serve MCP
+    over stdio.
+
+    If a primary is already running, become a *secondary*: bridge this
+    process's stdio to the primary over its UNIX socket so both agents share
+    the same connector WebSocket connection.
+    """
+    sock_path = _sock_path(ws_port)
+
+    if not await _check_if_primary(sock_path):
+        # Secondary mode — just bridge stdio to the running primary.
+        await _run_secondary(sock_path)
+        return
+
+    # Primary mode: WebSocket server + UNIX socket server + stdio MCP session.
+    log.info("Primary mode: starting WebSocket server and UNIX socket server")
     state = RelayState(connector_timeout=connector_timeout)
     server = build_mcp_server(state)
     init_opts = server.create_initialization_options()
 
     ws_task = asyncio.create_task(run_ws_server(state, ws_host, ws_port))
+    unix_task = asyncio.create_task(
+        _run_unix_socket_server(sock_path, server, init_opts)
+    )
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, init_opts)
     finally:
         ws_task.cancel()
+        unix_task.cancel()
+        for task in [ws_task, unix_task]:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # Remove the UNIX socket so stale files don't confuse future starts.
         try:
-            await ws_task
-        except asyncio.CancelledError:
+            os.unlink(sock_path)
+        except FileNotFoundError:
             pass
 
 
