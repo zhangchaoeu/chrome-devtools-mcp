@@ -393,7 +393,7 @@ def build_mcp_server(state: RelayState) -> Server:
             raw_content = msg.get("content", {})
             content_type = raw_content.get("type", "text")
             if content_type == "image":
-                msg_content: (
+                content: (
                     mcp_types.TextContent | mcp_types.ImageContent
                 ) = mcp_types.ImageContent(
                     type="image",
@@ -401,7 +401,7 @@ def build_mcp_server(state: RelayState) -> Server:
                     mimeType=raw_content.get("mimeType", "image/png"),
                 )
             else:
-                msg_content = mcp_types.TextContent(
+                content = mcp_types.TextContent(
                     type="text",
                     text=raw_content.get(
                         "text", json.dumps(raw_content, ensure_ascii=False)
@@ -410,7 +410,7 @@ def build_mcp_server(state: RelayState) -> Server:
             messages.append(
                 mcp_types.PromptMessage(
                     role=msg.get("role", "user"),
-                    content=msg_content,
+                    content=content,
                 )
             )
         return mcp_types.GetPromptResult(
