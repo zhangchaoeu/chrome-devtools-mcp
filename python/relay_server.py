@@ -2,8 +2,17 @@
 """
 chrome-devtools relay server -- runs on Server 33.
 
-Accepts a reverse WebSocket connection from connector.py on PC 32 and
-exposes tools/list and tools/call to MCP agents via stdio.
+Exposes a standard MCP server interface to any MCP client and forwards every
+tool request to the connector running on PC 32 via a reverse WebSocket tunnel:
+PC 32 dials into this server, not the other way around.
+
+Two MCP transports are supported so that clients like MCP Inspector can
+connect via URL:
+
+  --transport stdio  (default) — for Claude Desktop / Hermes / any client that
+                                  spawns this script as a subprocess.
+  --transport sse               — HTTP/SSE server on --http-port (default 7001),
+                                  for MCP Inspector and web-based MCP clients.
 
 Network topology
 ----------------
@@ -24,8 +33,8 @@ Network topology
        |
   Chrome browser (32)
 
-Multi-agent support
--------------------
+Multi-agent support (stdio mode)
+---------------------------------
   The first relay_server.py that starts becomes the *primary*: it binds the
   WebSocket port and creates a UNIX-domain socket at /tmp/relay-{port}.sock.
 
@@ -33,33 +42,29 @@ Multi-agent support
   becomes a *secondary*: it bridges its own stdin/stdout to the primary over the
   UNIX socket, so all agents share the same connector WebSocket connection.
 
+  In SSE mode each HTTP connection is already independent, so no UNIX socket is
+  needed — multiple agents simply open separate SSE connections to the same server.
+
 Usage (on Server 33)
 --------------------
-  Configure relay_server.py as a stdio MCP server in your agent host, e.g.
-  Claude Desktop (~/.claude/claude_desktop_config.json):
+  # stdio mode (Claude Desktop / Hermes / multi-Hermes):
+  python relay_server.py [--port 7000]
 
-    {
-      "mcpServers": {
-        "chrome-devtools": {
-          "command": "python",
-          "args": ["/path/to/relay_server.py", "--port", "7000"]
-        }
-      }
-    }
-
-  The agent host launches this script as a subprocess; the connector from
-  PC 32 dials in on the WebSocket port independently.
+  # SSE/HTTP mode (MCP Inspector, connect via URL http://server33:7001/sse):
+  python relay_server.py --transport sse [--http-port 7001] [--port 7000]
 
 Requirements
 ------------
   pip install -r requirements.txt
   # websockets>=13  mcp>=1.23.0
+  # For SSE mode also: starlette>=0.49.1  uvicorn>=0.34.2
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -67,7 +72,9 @@ import sys
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Iterable, Optional
+
+from pydantic import AnyUrl
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -86,6 +93,7 @@ except ImportError:
 try:
     import mcp.types as mcp_types
     from mcp.server import Server
+    from mcp.server.lowlevel.helper_types import ReadResourceContents
     from mcp.server.stdio import stdio_server
     from mcp.shared.message import SessionMessage
 except ImportError:
@@ -301,7 +309,10 @@ def _to_content_item(
 
 
 def build_mcp_server(state: RelayState) -> Server:
-    """Build an MCP Server that proxies tools/list and tools/call to the connector."""
+    """
+    Build an MCP Server that proxies tools, prompts, and resources to the
+    connector on PC 32.
+    """
     server: Server = Server("chrome-devtools-relay")
 
     @server.list_tools()
@@ -343,6 +354,109 @@ def build_mcp_server(state: RelayState) -> Server:
         content = result.get("content", [])
         log.debug("tools/call  name=%s  content_items=%d", name, len(content))
         return [_to_content_item(item) for item in content]
+
+    @server.list_prompts()
+    async def list_prompts() -> list[mcp_types.Prompt]:
+        try:
+            result = await state.forward("prompts/list", {})
+        except Exception as exc:
+            log.debug("prompts/list: returning empty list (%s)", exc)
+            return []
+        return [
+            mcp_types.Prompt(
+                name=p["name"],
+                description=p.get("description"),
+                arguments=[
+                    mcp_types.PromptArgument(
+                        name=a["name"],
+                        description=a.get("description"),
+                        required=a.get("required"),
+                    )
+                    for a in p.get("arguments", [])
+                ]
+                if p.get("arguments")
+                else None,
+            )
+            for p in result.get("prompts", [])
+        ]
+
+    @server.get_prompt()
+    async def get_prompt(
+        name: str,
+        arguments: dict[str, str] | None,
+    ) -> mcp_types.GetPromptResult:
+        result = await state.forward(
+            "prompts/get", {"name": name, "arguments": arguments or {}}
+        )
+        messages: list[mcp_types.PromptMessage] = []
+        for msg in result.get("messages", []):
+            raw_content = msg.get("content", {})
+            content_type = raw_content.get("type", "text")
+            if content_type == "image":
+                msg_content: (
+                    mcp_types.TextContent | mcp_types.ImageContent
+                ) = mcp_types.ImageContent(
+                    type="image",
+                    data=raw_content.get("data", ""),
+                    mimeType=raw_content.get("mimeType", "image/png"),
+                )
+            else:
+                msg_content = mcp_types.TextContent(
+                    type="text",
+                    text=raw_content.get(
+                        "text", json.dumps(raw_content, ensure_ascii=False)
+                    ),
+                )
+            messages.append(
+                mcp_types.PromptMessage(
+                    role=msg.get("role", "user"),
+                    content=msg_content,
+                )
+            )
+        return mcp_types.GetPromptResult(
+            description=result.get("description"),
+            messages=messages,
+        )
+
+    @server.list_resources()
+    async def list_resources() -> list[mcp_types.Resource]:
+        try:
+            result = await state.forward("resources/list", {})
+        except Exception as exc:
+            log.debug("resources/list: returning empty list (%s)", exc)
+            return []
+        return [
+            mcp_types.Resource(
+                name=r["name"],
+                uri=r["uri"],
+                description=r.get("description"),
+                mimeType=r.get("mimeType"),
+            )
+            for r in result.get("resources", [])
+        ]
+
+    @server.read_resource()
+    async def read_resource(uri: AnyUrl) -> Iterable[ReadResourceContents]:
+        result = await state.forward(
+            "resources/read", {"uri": str(uri)}
+        )
+        items: list[ReadResourceContents] = []
+        for c in result.get("contents", []):
+            if c.get("blob") is not None:
+                items.append(
+                    ReadResourceContents(
+                        content=base64.b64decode(c["blob"]),
+                        mime_type=c.get("mimeType"),
+                    )
+                )
+            else:
+                items.append(
+                    ReadResourceContents(
+                        content=c.get("text", ""),
+                        mime_type=c.get("mimeType"),
+                    )
+                )
+        return items
 
     return server
 
@@ -555,18 +669,111 @@ async def run_ws_server(state: RelayState, host: str, port: int) -> None:
 # -- Entry point -------------------------------------------------------------
 
 
-async def run_relay(ws_host: str, ws_port: int, connector_timeout: float) -> None:
+async def run_relay(
+    ws_host: str,
+    ws_port: int,
+    connector_timeout: float,
+    transport: str = "stdio",
+    http_host: str = "0.0.0.0",
+    http_port: int = 7001,
+) -> None:
     """
     Start the relay.
 
-    If no other relay is running on this port, become the *primary*: start the
-    WebSocket server, open a UNIX-socket server for secondaries, and serve MCP
-    over stdio.
+    stdio mode (default):
+      If no other relay is running on this port, become the *primary*: start the
+      WebSocket server, open a UNIX-socket server for secondaries, and serve MCP
+      over stdio.
 
-    If a primary is already running, become a *secondary*: bridge this
-    process's stdio to the primary over its UNIX socket so both agents share
-    the same connector WebSocket connection.
+      If a primary is already running, become a *secondary*: bridge this
+      process's stdio to the primary over its UNIX socket so both agents share
+      the same connector WebSocket connection.
+
+    sse mode:
+      Start an HTTP/SSE server on *http_host*:*http_port*.  Each connecting MCP
+      client gets its own session backed by the shared RelayState, so multiple
+      agents work naturally without UNIX-socket bridging.
     """
+    state = RelayState(connector_timeout=connector_timeout)
+    server = build_mcp_server(state)
+    init_opts = server.create_initialization_options()
+
+    if transport == "sse":
+        # SSE mode: HTTP server, no UNIX socket needed (each HTTP connection
+        # is an independent session that all share the same RelayState).
+        try:
+            from mcp.server.sse import SseServerTransport
+            from starlette.responses import Response
+            from starlette.types import Receive, Scope, Send
+            import uvicorn
+        except ImportError as exc:
+            print(
+                f"ERROR: SSE transport requires extra packages: {exc}\n"
+                "  pip install 'starlette>=0.49.1' 'uvicorn>=0.34.2'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        sse_transport = SseServerTransport("/messages/")
+
+        async def sse_endpoint(
+            scope: Scope, receive: Receive, send: Send
+        ) -> None:
+            async with sse_transport.connect_sse(scope, receive, send) as streams:
+                await server.run(streams[0], streams[1], init_opts)
+
+        async def asgi_router(
+            scope: Scope, receive: Receive, send: Send
+        ) -> None:
+            """
+            Minimal ASGI router that does NOT strip path prefixes or
+            modify scope['root_path'].  This ensures SseServerTransport
+            computes the correct client POST URL (/messages/?session_id=…).
+            """
+            if scope["type"] == "lifespan":
+                event = await receive()
+                if event["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                event = await receive()
+                if event["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                return
+
+            path: str = scope.get("path", "")
+            if scope["type"] == "http":
+                if path == "/sse":
+                    await sse_endpoint(scope, receive, send)
+                elif path.startswith("/messages"):
+                    await sse_transport.handle_post_message(scope, receive, send)
+                else:
+                    await Response("Not Found", status_code=404)(
+                        scope, receive, send
+                    )
+
+        ws_task = asyncio.create_task(run_ws_server(state, ws_host, ws_port))
+        try:
+            log.info(
+                "Starting relay in SSE mode: http://%s:%d/sse "
+                "(connector WS on ws://%s:%d)",
+                http_host, http_port, ws_host, ws_port,
+            )
+            uvi_config = uvicorn.Config(
+                asgi_router,
+                host=http_host,
+                port=http_port,
+                log_level="warning",
+            )
+            uvi_server = uvicorn.Server(uvi_config)
+            await uvi_server.serve()
+        finally:
+            ws_task.cancel()
+            try:
+                await ws_task
+            except asyncio.CancelledError:
+                pass
+        return
+
+    # stdio mode: primary/secondary via UNIX socket.
     sock_path = _sock_path(ws_port)
 
     if not await _check_if_primary(sock_path):
@@ -575,11 +782,11 @@ async def run_relay(ws_host: str, ws_port: int, connector_timeout: float) -> Non
         return
 
     # Primary mode: WebSocket server + UNIX socket server + stdio MCP session.
-    log.info("Primary mode: starting WebSocket server and UNIX socket server")
-    state = RelayState(connector_timeout=connector_timeout)
-    server = build_mcp_server(state)
-    init_opts = server.create_initialization_options()
-
+    log.info(
+        "Primary mode: stdio MCP server, connector WS on ws://%s:%d, "
+        "connector-timeout=%.1fs",
+        ws_host, ws_port, connector_timeout,
+    )
     ws_task = asyncio.create_task(run_ws_server(state, ws_host, ws_port))
     unix_task = asyncio.create_task(
         _run_unix_socket_server(sock_path, server, init_opts)
@@ -606,8 +813,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "chrome-devtools relay (Server 33 side). "
-            "Presents tools/list and tools/call via MCP over stdio and "
-            "forwards requests to the connector on PC 32 via a reverse "
+            "Presents an MCP interface (stdio or HTTP/SSE) to MCP clients and "
+            "forwards tool requests to the connector on PC 32 via a reverse "
             "WebSocket tunnel."
         )
     )
@@ -621,6 +828,29 @@ def main() -> None:
         "--host",
         default="0.0.0.0",
         help="Bind interface for the connector WebSocket server (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help=(
+            "MCP transport: 'stdio' (default, for Claude Desktop / Hermes) or "
+            "'sse' (HTTP/SSE server, for MCP Inspector and web-based clients)"
+        ),
+    )
+    parser.add_argument(
+        "--http-host",
+        default="0.0.0.0",
+        help=(
+            "Bind address for the HTTP/SSE server when --transport=sse "
+            "(default: 0.0.0.0)"
+        ),
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=7001,
+        help="Port for the HTTP/SSE MCP server when --transport=sse (default: 7001)",
     )
     parser.add_argument(
         "--connector-timeout",
@@ -641,13 +871,16 @@ def main() -> None:
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    log.info(
-        "Starting relay: stdio MCP server, connector WS on ws://%s:%d, connector-timeout=%.1fs",
-        args.host,
-        args.port,
-        args.connector_timeout,
+    asyncio.run(
+        run_relay(
+            ws_host=args.host,
+            ws_port=args.port,
+            connector_timeout=args.connector_timeout,
+            transport=args.transport,
+            http_host=args.http_host,
+            http_port=args.http_port,
+        )
     )
-    asyncio.run(run_relay(args.host, args.port, args.connector_timeout))
 
 
 if __name__ == "__main__":

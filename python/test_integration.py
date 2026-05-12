@@ -369,6 +369,7 @@ async def run_tests(mcp_cmd: str, browser_url: str) -> bool:
                 sys.executable,
                 RELAY_SCRIPT,
                 "--port", str(RELAY_WS_PORT),
+                "--transport", "sse",
                 "--http-port", str(RELAY_HTTP_PORT),
                 "--http-host", "127.0.0.1",
                 "--host", "127.0.0.1",
@@ -376,7 +377,7 @@ async def run_tests(mcp_cmd: str, browser_url: str) -> bool:
             "relay",
         )
 
-        await wait_for_log(relay_proc, "Starting relay:", timeout=15)
+        await wait_for_log(relay_proc, "Starting relay in SSE mode", timeout=15)
         await wait_for_port("127.0.0.1", RELAY_HTTP_PORT, timeout=10)
         log.info("Relay is up on http://127.0.0.1:%d/sse", RELAY_HTTP_PORT)
 
