@@ -73,6 +73,50 @@ logging.basicConfig(
 )
 log = logging.getLogger("connector")
 
+# ---------------------------------------------------------------------------
+# Transient-error detection
+# ---------------------------------------------------------------------------
+#
+# After the user clicks "Allow" on Chrome's remote-debugging authorisation
+# dialog, Puppeteer sometimes fails on its first CDP command (Network.enable,
+# Page.enable, …) because Chrome is still initialising the DevTools
+# connection.  These errors carry isError:true inside the MCP result rather
+# than a JSON-RPC "error" field, and are reliably resolved by waiting a
+# couple of seconds and retrying the same request.
+#
+# The phrases below are matched case-insensitively against the text content
+# of any isError:true response.
+
+_TRANSIENT_ERROR_PHRASES: tuple[str, ...] = (
+    "timed out",
+    "timeout",
+    "target closed",
+    "connection closed",
+    "protocol error",
+    "session closed",
+)
+
+
+def _is_transient_tool_error(result: dict[str, Any]) -> str | None:
+    """
+    Return the first error text found if *result* is a transient MCP tool
+    error worth retrying, or ``None`` if the result is final.
+
+    A result is considered transient when ``isError`` is true **and** the
+    text of at least one content item contains one of the phrases in
+    ``_TRANSIENT_ERROR_PHRASES``.
+    """
+    if not result.get("isError"):
+        return None
+    for item in result.get("content", []):
+        if isinstance(item, dict) and item.get("type") == "text":
+            text: str = item.get("text", "")
+            lower = text.lower()
+            for phrase in _TRANSIENT_ERROR_PHRASES:
+                if phrase in lower:
+                    return text
+    return None
+
 
 # -- MCP subprocess helpers --------------------------------------------------
 #
@@ -311,10 +355,19 @@ async def handle_relay_message(
     mcp: McpProcess,
     ws: ClientConnection,
     tool_timeout: float,
+    retry_count: int,
+    retry_delay: float,
 ) -> None:
     """
     Parse one request from the relay, forward it to the MCP subprocess, and
     send the response back over the WebSocket.
+
+    If the subprocess returns an ``isError:true`` result that matches a
+    known transient Puppeteer/CDP fault (e.g. "Network.enable timed out"),
+    the request is retried up to *retry_count* times with *retry_delay*
+    seconds between attempts.  This recovers automatically from the
+    transient timeout that Chrome triggers right after the user clicks
+    "Allow" on the remote-debugging authorisation dialog.
     """
     text = raw if isinstance(raw, str) else raw.decode("utf-8")
     log.debug("relay->connector  raw WS frame: %r", text[:500])
@@ -335,34 +388,65 @@ async def handle_relay_message(
 
     req_id_str = str(req_id)
 
-    try:
-        result = await mcp.call(req_id_str, method, params, timeout=tool_timeout)
-        log.debug(
-            "relay->connector  id=%s  method=%s  result_keys=%s",
-            req_id_str,
-            method,
-            list(result.keys()) if isinstance(result, dict) else f'<{type(result).__name__}>',
-        )
-        response: dict[str, Any] = {"id": req_id, "result": result}
-    except RuntimeError as exc:
-        msg = str(exc)
-        parsed: dict[str, Any] | None = None
+    response: dict[str, Any] = {}
+    for attempt in range(retry_count + 1):
         try:
-            parsed = json.loads(msg)
-        except json.JSONDecodeError:
-            pass
-        if isinstance(parsed, dict) and parsed.get("code") == -32601:
-            log.warning("Unhandled MCP method=%s: %s", method, msg)
-            response = {"id": req_id, "error": parsed}
-        else:
+            result = await mcp.call(req_id_str, method, params, timeout=tool_timeout)
+            log.debug(
+                "relay->connector  id=%s  method=%s  result_keys=%s",
+                req_id_str,
+                method,
+                list(result.keys()) if isinstance(result, dict) else f'<{type(result).__name__}>',
+            )
+
+            error_text = _is_transient_tool_error(result)
+            if error_text is not None and attempt < retry_count:
+                log.warning(
+                    "Transient tool error for id=%s method=%s (attempt %d/%d): "
+                    "%s -- retrying in %.1fs",
+                    req_id_str,
+                    method,
+                    attempt + 1,
+                    retry_count,
+                    error_text[:120],
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            if error_text is not None:
+                log.error(
+                    "Transient tool error for id=%s method=%s persists after "
+                    "%d retries, giving up: %s",
+                    req_id_str,
+                    method,
+                    retry_count,
+                    error_text[:120],
+                )
+
+            response = {"id": req_id, "result": result}
+            break
+        except RuntimeError as exc:
+            msg = str(exc)
+            parsed: dict[str, Any] | None = None
+            try:
+                parsed = json.loads(msg)
+            except json.JSONDecodeError:
+                pass
+            if isinstance(parsed, dict) and parsed.get("code") == -32601:
+                log.warning("Unhandled MCP method=%s: %s", method, msg)
+                response = {"id": req_id, "error": parsed}
+            else:
+                log.exception("MCP subprocess error for method=%s", method)
+                response = {"id": req_id, "error": {"code": -32603, "message": msg}}
+            break
+        except Exception as exc:
             log.exception("MCP subprocess error for method=%s", method)
-            response = {"id": req_id, "error": {"code": -32603, "message": msg}}
-    except Exception as exc:
-        log.exception("MCP subprocess error for method=%s", method)
-        response = {
-            "id": req_id,
-            "error": {"code": -32603, "message": str(exc)},
-        }
+            response = {
+                "id": req_id,
+                "error": {"code": -32603, "message": str(exc)},
+            }
+            break
 
     await ws.send(json.dumps(response, ensure_ascii=False))
     log.debug(
@@ -376,7 +460,13 @@ async def handle_relay_message(
 # -- WebSocket connect-and-run loop ------------------------------------------
 
 
-async def connect_and_run(relay_url: str, mcp: McpProcess, tool_timeout: float) -> None:
+async def connect_and_run(
+    relay_url: str,
+    mcp: McpProcess,
+    tool_timeout: float,
+    retry_count: int,
+    retry_delay: float,
+) -> None:
     """
     Connect to the relay WebSocket and process requests until the connection
     drops or the MCP subprocess dies.
@@ -393,7 +483,7 @@ async def connect_and_run(relay_url: str, mcp: McpProcess, tool_timeout: float) 
                 break
 
             task: asyncio.Task[None] = asyncio.create_task(
-                handle_relay_message(raw, mcp, ws, tool_timeout)
+                handle_relay_message(raw, mcp, ws, tool_timeout, retry_count, retry_delay)
             )
             pending_tasks.add(task)
             task.add_done_callback(pending_tasks.discard)
@@ -461,6 +551,25 @@ async def main() -> None:
         ),
     )
     parser.add_argument(
+        "--retry-count",
+        type=int,
+        default=3,
+        help=(
+            "Number of times to retry a tool call that returns a transient "
+            "error (e.g. 'Network.enable timed out') before forwarding the "
+            "error to the relay. Default: 3.  Set to 0 to disable retries."
+        ),
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=2.0,
+        help=(
+            "Seconds to wait between retry attempts for transient tool "
+            "errors (default: 2.0)."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable DEBUG-level logging (logs all WS and stdio message content)",
@@ -492,7 +601,10 @@ async def main() -> None:
                     await mcp.terminate()
                 mcp = await start_mcp_process(mcp_args)
 
-            await connect_and_run(args.relay_url, mcp, args.tool_timeout)
+            await connect_and_run(
+                args.relay_url, mcp, args.tool_timeout,
+                args.retry_count, args.retry_delay,
+            )
             log.info(
                 "Disconnected from relay. Reconnecting in %.1fs ...",
                 args.reconnect_delay,
