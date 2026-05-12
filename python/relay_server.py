@@ -64,6 +64,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
@@ -350,8 +351,13 @@ def build_mcp_server(state: RelayState) -> Server:
 
 
 def _sock_path(port: int) -> str:
-    """UNIX-domain socket path used to share a primary relay with secondaries."""
-    return f"/tmp/relay-{port}.sock"
+    """
+    UNIX-domain socket path used to share a primary relay with secondaries.
+
+    Note: UNIX-domain sockets are not supported on Windows.  The relay server
+    is designed for Linux/macOS deployments.
+    """
+    return os.path.join(tempfile.gettempdir(), f"relay-{port}.sock")
 
 
 async def _check_if_primary(sock_path: str) -> bool:
