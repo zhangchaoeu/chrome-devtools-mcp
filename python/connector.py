@@ -97,7 +97,7 @@ _TRANSIENT_ERROR_PHRASES: tuple[str, ...] = (
 )
 
 
-def _is_transient_tool_error(result: dict[str, Any]) -> str | None:
+def _get_transient_error_text(result: dict[str, Any]) -> str | None:
     """
     Return the first error text found if *result* is a transient MCP tool
     error worth retrying, or ``None`` if the result is final.
@@ -389,6 +389,10 @@ async def handle_relay_message(
     req_id_str = str(req_id)
 
     response: dict[str, Any] = {}
+    # range(retry_count + 1) gives attempt indices 0 … retry_count.
+    # attempt 0  = initial try (not a retry)
+    # attempt 1 … retry_count = actual retries
+    # Total calls = 1 initial + retry_count retries.
     for attempt in range(retry_count + 1):
         try:
             result = await mcp.call(req_id_str, method, params, timeout=tool_timeout)
@@ -399,11 +403,11 @@ async def handle_relay_message(
                 list(result.keys()) if isinstance(result, dict) else f'<{type(result).__name__}>',
             )
 
-            error_text = _is_transient_tool_error(result)
+            error_text = _get_transient_error_text(result)
             if error_text is not None and attempt < retry_count:
                 log.warning(
-                    "Transient tool error for id=%s method=%s (attempt %d/%d): "
-                    "%s -- retrying in %.1fs",
+                    "Transient tool error for id=%s method=%s "
+                    "(retry %d of %d): %s -- retrying in %.1fs",
                     req_id_str,
                     method,
                     attempt + 1,
@@ -417,10 +421,11 @@ async def handle_relay_message(
             if error_text is not None:
                 log.error(
                     "Transient tool error for id=%s method=%s persists after "
-                    "%d retries, giving up: %s",
+                    "%d retr%s, giving up: %s",
                     req_id_str,
                     method,
                     retry_count,
+                    "y" if retry_count == 1 else "ies",
                     error_text[:120],
                 )
 
